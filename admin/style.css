@@ -178,10 +178,134 @@ tfoot th, tfoot td { border-top: 2px solid #ddd; border-bottom: none; font-weigh
 .chart-legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: #555; margin: 8px 0 0 52px; }
 .chart-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
 
+/* ============================================================ */
+/* Panel v2 — sub-tabs, deal drawer, badges, timelines, health   */
+/* ============================================================ */
+
+/* ---- user-detail sub-tabs ---- */
+.subtabs { display: flex; gap: 4px; border-bottom: 1px solid #eee; margin: 16px 0 16px; }
+
+/* ---- search / filter controls ---- */
+.users-controls { margin: 10px 0 4px; }
+.input-search { max-width: 320px; }
+.deals-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0 4px; }
+.deals-controls .input-search { flex: 1 1 220px; }
+select.select-small {
+  font: inherit; font-size: 13px; padding: 6px 8px; border: 1px solid #d0d7de;
+  border-radius: 6px; background: #fff; color: #1a1a1a;
+}
+.pager { display: flex; gap: 12px; align-items: center; margin-top: 10px; }
+.load-more { margin-top: 12px; text-align: center; }
+
+/* ---- sortable table headers ---- */
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: #1a1a1a; }
+
+/* ---- extra badges ---- */
+.badge-note { background: #fef3c7; color: #92400e; }
+.badge-earned { background: #dcfce7; color: #166534; }
+.badge-pending { background: #fef3c7; color: #92400e; }
+.badge-cancelled { background: #e5e7eb; color: #4b5563; }
+.badge-unpaid { background: #fee2e2; color: #b91c1c; }
+.badge-src-imported { background: #ede9fe; color: #5b21b6; }
+.badge-src-manual { background: #fef3c7; color: #92400e; }
+.badge-src-computed { background: #f1f5f9; color: #64748b; }
+.badge-table { background: #f1f5f9; color: #475569; }
+.badge-action-insert { background: #dcfce7; color: #166534; }
+.badge-action-update { background: #dbeafe; color: #1e40af; }
+.badge-action-delete { background: #fee2e2; color: #b91c1c; }
+
+.mono-sm { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+/* ---- admin note ---- */
+.note-area {
+  width: 100%; font: inherit; font-size: 14px; padding: 8px 10px;
+  border: 1px solid #d0d7de; border-radius: 6px; resize: vertical;
+}
+
+/* ---- deal drawer ---- */
+.drawer-backdrop { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.4); z-index: 40; }
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100%);
+  background: #fff; z-index: 41; overflow-y: auto; padding: 20px 24px 40px;
+  box-shadow: -6px 0 28px rgba(0, 0, 0, 0.22);
+}
+.drawer-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.drawer-head h2 { overflow-wrap: anywhere; }
+.drawer-sub { color: #888; margin: 2px 0 0; }
+.drawer-badges { margin: 8px 0 4px; }
+.drawer-badges .badge { margin-left: 0; margin-right: 6px; }
+.group-head {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: #1f6feb;
+  margin: 22px 0 6px; padding-bottom: 4px; border-bottom: 1px solid #eef2f6;
+}
+.ro-val { color: #888; }
+
+/* ---- drawer edit mode ---- */
+.edit-grid {
+  display: grid; grid-template-columns: 185px 1fr; gap: 8px 12px; align-items: center;
+  margin-top: 4px;
+}
+.edit-grid .edit-label { font-size: 13px; color: #555; margin: 0; }
+.edit-grid input, .edit-grid select, .edit-grid textarea {
+  font: inherit; font-size: 13.5px; padding: 6px 9px; border: 1px solid #d0d7de;
+  border-radius: 6px; background: #fff; color: #1a1a1a; width: 100%;
+}
+.edit-grid textarea { resize: vertical; }
+.edit-grid .guard-field { border-color: #e0b4b4; background: #fffafa; }
+
+.edit-footer { margin-top: 24px; border-top: 2px solid #eee; padding-top: 14px; }
+.warn-imported {
+  border: 1px solid #f0b4b4; background: #fff5f5; color: #82071e;
+  border-radius: 8px; padding: 10px 14px; font-size: 13.5px; margin-bottom: 10px;
+}
+.warn-derived {
+  border: 1px solid #eed888; background: #fff8e5; color: #7a5b00;
+  border-radius: 8px; padding: 10px 14px; font-size: 13.5px; margin-bottom: 10px;
+}
+.diff-panel {
+  border: 1px solid #d0d7de; background: #f6f8fa; border-radius: 8px;
+  padding: 10px 14px; font-size: 13px; margin-bottom: 10px;
+}
+.diff-panel .diff-head { margin: 0 0 6px; font-weight: 600; }
+.diff-panel .hint { margin: 0; }
+.diff-row { margin: 2px 0; overflow-wrap: anywhere; }
+.diff-old { color: #cf222e; text-decoration: line-through; }
+.diff-new { color: #1a7f37; font-weight: 600; }
+.tl-field { color: #555; font-weight: 600; }
+.force-row { display: block; font-size: 13.5px; margin: 0 0 10px; }
+.force-row input { width: auto; margin-right: 6px; }
+.force-row.force-needed { color: #82071e; font-weight: 600; }
+.save-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.confirm-input { width: 130px; }
+
+/* ---- timelines ---- */
+.timeline { list-style: none; padding: 0; margin: 8px 0 0; }
+.timeline li {
+  border-left: 2px solid #e5e9ee; padding: 6px 0 6px 14px; margin-left: 6px;
+  font-size: 14px;
+}
+.timeline li.clickable { cursor: pointer; }
+.timeline li.clickable:hover { background: #f6f8fa; }
+.tl-time { color: #888; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.tl-fields { color: #333; }
+.tl-created { color: #1a7f37; }
+.tl-deleted { color: #cf222e; }
+.tl-diffs { margin-top: 3px; }
+.tl-diff { font-size: 13px; margin: 1px 0; overflow-wrap: anywhere; }
+
+/* ---- health / log ---- */
+.health-section { margin-top: 36px; border-top: 2px solid #eee; padding-top: 16px; }
+.params-cell { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ---- mobile ---- */
 @media (max-width: 600px) {
   body { padding: 16px 12px; }
   .signin-card { margin-top: 24px; padding: 20px; }
   .section-head { flex-wrap: wrap; }
   .bar-label, .bar-count { width: 38px; }
+  .drawer { width: 100%; padding: 16px 14px 32px; }
+  .edit-grid { grid-template-columns: 1fr; gap: 2px 0; }
+  .edit-grid .edit-label { margin-top: 8px; }
+  .params-cell { max-width: 220px; }
 }

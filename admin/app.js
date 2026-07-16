@@ -15,15 +15,22 @@ const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // ---------------------------------------------------------------------------
 const state = {
   view: 'loading',       // loading | signin | denied | panel
-  tab: 'users',          // users | stats | settings
+  tab: 'users',          // users | stats | settings | log
   signinMsg: '',
   config: null,          // { scanning_enabled, default_daily_scan_cap }
   configError: '',
   users: null,           // null = loading, [] = loaded
   usersError: '',
-  detail: null,          // { row, data, error, deleted }
+  usersQuery: '',        // client-side email filter
+  usersSort: { key: 'created_at', dir: 'desc' },
+  detail: null,          // { row, data, error, deleted, section, deals, activity, deletedDeals }
   stats: null,           // null = loading, [] = loaded (zero-filled 30 days)
   statsError: '',
+  health: null,          // null = loading; { daily, by_version, recent_failures }
+  healthError: '',
+  log: null,             // null = loading; { rows, nextBefore }
+  logError: '',
+  drawer: null,          // { dealId, data: {deal, audit, scan_event}, error, edit }
 };
 
 const appEl = document.getElementById('app');
@@ -43,8 +50,12 @@ function resetToSignin(msg) {
   state.signinMsg = msg || '';
   state.config = null;
   state.users = null;
+  state.usersQuery = '';
   state.detail = null;
   state.stats = null;
+  state.health = null;
+  state.log = null;
+  state.drawer = null;
   render();
 }
 
@@ -131,11 +142,21 @@ const intFmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
 const money = (n) => (n == null ? '—'
   : '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 const fmtCost = (n) => (n == null ? '' : '$' + Number(n).toFixed(4));
+const pctFmt = (n) => (n == null ? '—' : (Number(n) * 100).toFixed(1) + '%');
 
 function fmtDate(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
   return isNaN(d) ? '—' : d.toLocaleDateString();
+}
+
+// Plain DATE columns (deal_date etc.) — reformat the ISO string directly.
+// new Date('YYYY-MM-DD') parses as UTC and can render the PRIOR day in
+// negative-offset timezones; never route plain dates through Date.
+function fmtISODate(v) {
+  if (!v) return '—';
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v));
+  return m ? m[2] + '/' + m[3] + '/' + m[1] : String(v);
 }
 
 function fmtDateTime(iso) {
@@ -161,6 +182,19 @@ function fmtDur(ms) {
 
 function humanize(key) {
   return String(key).replace(/_/g, ' ');
+}
+
+function truncate(s, n) {
+  s = String(s);
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+// Compact single value for diffs / params — never multiline, always short.
+function fmtVal(v) {
+  if (v === null || v === undefined) return '∅';
+  if (typeof v === 'string') return truncate(v, 60) || '""';
+  if (typeof v === 'object') return truncate(JSON.stringify(v), 60);
+  return String(v);
 }
 
 function lastActive(u) {
@@ -196,6 +230,169 @@ function normalizeConfig(resp) {
 }
 
 // ---------------------------------------------------------------------------
+// Deal field registry — mirrors the server's DEALS_COLUMNS (admin-api) and
+// schema.sql. id / user_id are immutable (rendered read-only in edit mode).
+// ---------------------------------------------------------------------------
+const DEAL_GROUPS = [
+  ['Identity', ['id', 'user_id', 'account_number', 'owner_names', 'phone_numbers',
+    'representative_number', 'manager_number', 'closing_officer_number']],
+  ['Dates', ['deal_date', 'date_logged', 'paid_in_full_date', 'pender_final_payment_date']],
+  ['Money', ['purchase_price', 'upg_amount', 'volume', 'down_payment', 'closing_cost',
+    'interval_dues', 'down_payment_required', 'balance_remaining', 'amount_received_today',
+    'amount_received_breakdown', 'additional_payments_due', 'annual_rate', 'months_financed',
+    'monthly_payment']],
+  ['Commission', ['commission_rate', 'commission_amount', 'commission_status', 'commission_source']],
+  ['Status', ['pender_status', 'cancelled', 'cancel_reason', 'deal_type', 'existing_owner']],
+  ['Meta', ['entry_method', 'market_source', 'site_origin', 'resort', 'unit_size', 'notes',
+    'source_image_ref', 'scan_event_id', 'import_metadata']],
+];
+
+const IMMUTABLE_COLS = ['id', 'user_id'];
+
+// Input type per column; anything absent = nullable free text.
+// Arrays are enum options ('' entry = nullable).
+const FIELD_TYPES = {
+  purchase_price: 'number', down_payment: 'number', closing_cost: 'number',
+  interval_dues: 'number', amount_received_today: 'number', annual_rate: 'number',
+  months_financed: 'number', monthly_payment: 'number', upg_amount: 'number',
+  down_payment_required: 'number', balance_remaining: 'number', volume: 'number',
+  commission_rate: 'number', commission_amount: 'number',
+  pender_status: 'bool', cancelled: 'bool',
+  existing_owner: 'bool-null',
+  deal_type: ['new', 'upgrade'],
+  commission_status: ['pending', 'earned'],
+  commission_source: ['computed', 'manual', 'imported'],
+  entry_method: ['scanned', 'manual'],
+  cancel_reason: ['', 'rescission', 'unpaid_pender'],
+  deal_date: 'date', paid_in_full_date: 'date', pender_final_payment_date: 'date',
+  date_logged: 'datetime',
+  owner_names: 'lines', phone_numbers: 'lines',
+  additional_payments_due: 'json-array', import_metadata: 'json',
+};
+
+// NOT NULL columns whose input type can produce null — blank blocks save
+// client-side instead of round-tripping a 23502.
+const NOT_NULL_COLS = ['volume', 'commission_rate', 'commission_amount',
+  'down_payment_required', 'balance_remaining', 'date_logged'];
+
+// Mirror of the server's IMPORTED_GUARD_FIELDS (§3.11c).
+const GUARD_FIELDS = ['commission_rate', 'commission_amount', 'commission_status',
+  'commission_source', 'volume', 'purchase_price', 'upg_amount'];
+
+const MONEY_COLS = ['purchase_price', 'upg_amount', 'volume', 'down_payment', 'closing_cost',
+  'interval_dues', 'down_payment_required', 'balance_remaining', 'amount_received_today',
+  'commission_amount', 'monthly_payment'];
+const PCT_COLS = ['commission_rate', 'annual_rate'];
+const ISO_DATE_COLS = ['deal_date', 'paid_in_full_date', 'pender_final_payment_date'];
+
+// Encode a stored value into its edit-input string.
+function encodeFieldValue(col, v) {
+  const t = FIELD_TYPES[col] || 'text';
+  if (v === null || v === undefined) return '';
+  if (Array.isArray(t)) return String(v);
+  switch (t) {
+    case 'number': return String(v);
+    case 'bool': case 'bool-null': return v ? 'true' : 'false';
+    case 'date': return String(v).slice(0, 10);
+    case 'lines': return Array.isArray(v) ? v.join('\n') : '';
+    case 'json': case 'json-array': return JSON.stringify(v, null, 2);
+    default: return String(v);
+  }
+}
+
+// Parse an edit-input string back into a column value.
+// Returns { value } or { error }.
+function parseFieldValue(col, raw) {
+  const t = FIELD_TYPES[col] || 'text';
+  let out;
+  if (Array.isArray(t)) {
+    out = { value: raw === '' ? null : raw };
+  } else if (t === 'number') {
+    const s = String(raw).trim();
+    if (s === '') out = { value: null };
+    else {
+      const n = Number(s);
+      out = Number.isFinite(n) ? { value: n } : { error: 'not a number' };
+    }
+  } else if (t === 'bool') {
+    out = { value: raw === 'true' };
+  } else if (t === 'bool-null') {
+    out = { value: raw === '' ? null : raw === 'true' };
+  } else if (t === 'date') {
+    out = { value: raw === '' ? null : raw };
+  } else if (t === 'datetime') {
+    const s = String(raw).trim();
+    out = { value: s === '' ? null : s };
+  } else if (t === 'lines') {
+    out = { value: String(raw).split('\n').map((x) => x.trim()).filter(Boolean) };
+  } else if (t === 'json' || t === 'json-array') {
+    const s = String(raw).trim();
+    if (s === '') out = { value: t === 'json-array' ? [] : null }; // jsonb NOT NULL DEFAULT '[]'
+    else {
+      try { out = { value: JSON.parse(s) }; } catch (e) { out = { error: 'invalid JSON' }; }
+    }
+  } else {
+    const s = String(raw);
+    out = { value: s.trim() === '' ? null : s };
+  }
+  if (!out.error && out.value === null && NOT_NULL_COLS.includes(col)) {
+    out = { error: 'required (NOT NULL column)' };
+  }
+  return out;
+}
+
+const valueEq = (a, b) =>
+  JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+
+// Read-view formatting per column.
+function readValue(col, v) {
+  if (col === 'import_metadata') {
+    return v && typeof v === 'object' ? 'present (' + Object.keys(v).length + ' keys)' : '—';
+  }
+  if (v === null || v === undefined) return '—';
+  if (MONEY_COLS.includes(col)) return money(v);
+  if (PCT_COLS.includes(col)) return String(v) + '%';
+  if (ISO_DATE_COLS.includes(col)) return fmtISODate(v);
+  if (col === 'date_logged') return fmtDateTime(v);
+  if (col === 'owner_names' || col === 'phone_numbers') {
+    return Array.isArray(v) && v.length ? v.join(', ') : '—';
+  }
+  if (typeof v === 'boolean') return v ? 'Yes' : 'No';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+
+// Status badge per the app's §3.5 language: TEXT = type, COLOR = money state
+// (green earned, amber open pender, grey cancelled, red unpaid).
+function dealStatusBadge(deal) {
+  if (deal.cancelled) {
+    return deal.cancel_reason === 'unpaid_pender'
+      ? el('span', { class: 'badge badge-unpaid', text: 'Unpaid' })
+      : el('span', { class: 'badge badge-cancelled', text: 'Cancelled' });
+  }
+  const earned = deal.commission_status === 'earned';
+  const cls = earned ? 'badge-earned' : 'badge-pending';
+  return el('span', { class: 'badge ' + cls, text: deal.pender_status ? 'Pender' : 'Full Down' });
+}
+
+function sourceBadge(src) {
+  if (src === 'imported') return el('span', { class: 'badge badge-src-imported', text: 'imported' });
+  if (src === 'manual') return el('span', { class: 'badge badge-src-manual', text: 'manual' });
+  if (src === 'computed' || src == null) return el('span', { class: 'badge badge-src-computed', text: 'computed' });
+  // unknown ≠ default: an unexpected value renders as itself, never mapped.
+  return el('span', { class: 'badge badge-src-computed', text: String(src) });
+}
+
+// Changed field NAMES for an audit row (UPDATE only).
+function changedFieldNames(a) {
+  if (a.action !== 'UPDATE') return [];
+  const oldR = a.old_row || {};
+  const newR = a.new_row || {};
+  const keys = new Set(Object.keys(oldR).concat(Object.keys(newR)));
+  return [...keys].filter((k) => !valueEq(oldR[k], newR[k])).sort();
+}
+
+// ---------------------------------------------------------------------------
 // Boot + auth flow
 // ---------------------------------------------------------------------------
 async function init() {
@@ -217,6 +414,7 @@ async function probe() {
     state.view = 'panel';
     state.tab = 'users';
     state.detail = null;
+    state.drawer = null;
     render();
     loadUsers();
   } catch (e) {
@@ -246,14 +444,20 @@ function normalizeDetail(resp) {
   const d = resp || {};
   return {
     aggregates: d.aggregates || d.user || d.stats || {},
-    events: d.scan_events || d.events || [],
+    events: d.scan_events || d.recent_scan_events || d.events || [],
     settings: d.user_settings || d.settings || null,
-    cap: d.cap || d.scan_cap || d.cap_row || null,
+    cap: d.cap || d.scan_limit || d.scan_cap || d.cap_row || null,
   };
 }
 
 function openDetail(row) {
-  state.detail = { row, data: null, error: '', deleted: null };
+  state.detail = {
+    row, data: null, error: '', deleted: null,
+    section: 'overview',
+    deals: { query: '', cancelled: 'any', pender: 'any', offset: 0, rows: null, total: 0, error: '' },
+    activity: { rows: null, nextBefore: null, error: '', loadingMore: false },
+    deletedDeals: { rows: null, error: '' },
+  };
   render();
   loadDetail(row.user_id);
 }
@@ -270,6 +474,81 @@ async function loadDetail(userId) {
     state.detail.data = { aggregates: {}, events: [], settings: null, cap: null };
   }
   if (state.view === 'panel' && state.tab === 'users' && state.detail) render();
+}
+
+function rerenderIfSection(id) {
+  if (state.view === 'panel' && state.tab === 'users' && state.detail && state.detail.section === id) render();
+}
+
+// silent = keep the current rows on screen while refreshing (post-save).
+async function loadDeals(silent) {
+  const d = state.detail;
+  if (!d) return;
+  const s = d.deals;
+  s.error = '';
+  if (!silent) { s.rows = null; rerenderIfSection('deals'); }
+  const params = { user_id: d.row.user_id, limit: 50, offset: s.offset };
+  if (s.query.trim()) params.query = s.query.trim();
+  if (s.cancelled !== 'any') params.cancelled = s.cancelled === 'true';
+  if (s.pender !== 'any') params.pender = s.pender === 'true';
+  try {
+    const resp = await adminApi('list_deals', params);
+    if (state.detail !== d) return;
+    s.rows = (resp && resp.deals) || [];
+    s.total = resp && typeof resp.total === 'number' ? resp.total : 0;
+  } catch (e) {
+    if (e.handled) return;
+    if (state.detail !== d) return;
+    s.rows = [];
+    s.total = 0;
+    s.error = e.message;
+  }
+  rerenderIfSection('deals');
+}
+
+async function loadActivity(more) {
+  const d = state.detail;
+  if (!d) return;
+  const s = d.activity;
+  s.error = '';
+  if (!more) { s.rows = null; s.nextBefore = null; rerenderIfSection('activity'); }
+  else { s.loadingMore = true; rerenderIfSection('activity'); }
+  const params = { user_id: d.row.user_id, limit: 100 };
+  if (more && s.nextBefore) params.before = s.nextBefore;
+  try {
+    const resp = await adminApi('user_audit', params);
+    if (state.detail !== d) return;
+    const rows = (resp && resp.audit) || [];
+    s.rows = more ? (s.rows || []).concat(rows) : rows;
+    s.nextBefore = (resp && resp.next_before) || null;
+  } catch (e) {
+    if (e.handled) return;
+    if (state.detail !== d) return;
+    if (!more) s.rows = [];
+    s.error = e.message;
+  }
+  s.loadingMore = false;
+  rerenderIfSection('activity');
+}
+
+async function loadDeletedDeals() {
+  const d = state.detail;
+  if (!d) return;
+  const s = d.deletedDeals;
+  s.error = '';
+  s.rows = null;
+  rerenderIfSection('deleted');
+  try {
+    const resp = await adminApi('list_deleted_deals', { user_id: d.row.user_id, limit: 50 });
+    if (state.detail !== d) return;
+    s.rows = (resp && resp.deleted) || [];
+  } catch (e) {
+    if (e.handled) return;
+    if (state.detail !== d) return;
+    s.rows = [];
+    s.error = e.message;
+  }
+  rerenderIfSection('deleted');
 }
 
 const num = (v) => (v == null ? 0 : Number(v) || 0);
@@ -328,6 +607,46 @@ async function loadStats() {
   if (state.view === 'panel' && state.tab === 'stats') render();
 }
 
+async function loadHealth() {
+  state.healthError = '';
+  state.health = null;
+  if (state.view === 'panel' && state.tab === 'stats') render();
+  try {
+    const resp = await adminApi('health_stats', { days: 30 });
+    state.health = {
+      daily: (resp && Array.isArray(resp.daily)) ? resp.daily : [],
+      by_version: (resp && Array.isArray(resp.by_version)) ? resp.by_version : [],
+      recent_failures: (resp && Array.isArray(resp.recent_failures)) ? resp.recent_failures : [],
+    };
+  } catch (e) {
+    if (e.handled) return;
+    state.health = { daily: [], by_version: [], recent_failures: [] };
+    state.healthError = e.message;
+  }
+  if (state.view === 'panel' && state.tab === 'stats') render();
+}
+
+async function loadLog(more) {
+  state.logError = '';
+  if (!more) { state.log = null; if (state.view === 'panel' && state.tab === 'log') render(); }
+  const params = { limit: 100 };
+  const prev = more && state.log ? state.log : null;
+  if (prev && prev.nextBefore) params.before = prev.nextBefore;
+  try {
+    const resp = await adminApi('list_admin_actions', params);
+    const rows = (resp && resp.actions) || [];
+    state.log = {
+      rows: prev ? prev.rows.concat(rows) : rows,
+      nextBefore: (resp && resp.next_before) || null,
+    };
+  } catch (e) {
+    if (e.handled) return;
+    if (!state.log) state.log = { rows: [], nextBefore: null };
+    state.logError = e.message;
+  }
+  if (state.view === 'panel' && state.tab === 'log') render();
+}
+
 async function refreshConfig() {
   state.configError = '';
   try {
@@ -338,6 +657,53 @@ async function refreshConfig() {
     state.configError = e.message;
   }
   if (state.view === 'panel' && state.tab === 'settings') render();
+}
+
+// ---------------------------------------------------------------------------
+// Deal drawer loaders
+// ---------------------------------------------------------------------------
+function openDrawer(dealId) {
+  state.drawer = { dealId, data: null, error: '', edit: null };
+  render();
+  loadDrawer(dealId);
+}
+
+async function loadDrawer(dealId) {
+  const dr = state.drawer;
+  if (!dr || dr.dealId !== dealId) return;
+  try {
+    const resp = await adminApi('get_deal', { deal_id: dealId });
+    if (state.drawer !== dr) return;
+    dr.data = {
+      deal: (resp && resp.deal) || {},
+      audit: (resp && resp.audit) || [],
+      scan_event: (resp && resp.scan_event) || null,
+    };
+  } catch (e) {
+    if (e.handled) return;
+    if (state.drawer !== dr) return;
+    dr.error = e.message;
+  }
+  render();
+}
+
+// Post-save: refresh audit/scan without blanking the drawer.
+async function refreshDrawerQuiet(dr) {
+  try {
+    const resp = await adminApi('get_deal', { deal_id: dr.dealId });
+    if (state.drawer !== dr) return;
+    dr.data = {
+      deal: (resp && resp.deal) || dr.data.deal,
+      audit: (resp && resp.audit) || dr.data.audit,
+      scan_event: resp ? (resp.scan_event || null) : dr.data.scan_event,
+    };
+    render();
+  } catch (e) { /* quiet refresh — keep what we have */ }
+}
+
+function closeDrawer() {
+  state.drawer = null;
+  render();
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +720,7 @@ function render() {
     appEl.append(viewDenied());
   } else {
     appEl.append(viewPanel());
+    if (state.drawer) appEl.append(viewDrawer());
   }
 }
 
@@ -405,7 +772,7 @@ function viewDenied() {
 
 function viewPanel() {
   const tabs = el('nav', { class: 'tabs' },
-    [['users', 'Users'], ['stats', 'Stats'], ['settings', 'Settings']].map(([id, label]) =>
+    [['users', 'Users'], ['stats', 'Stats'], ['settings', 'Settings'], ['log', 'Log']].map(([id, label]) =>
       el('button', {
         class: 'tab' + (state.tab === id ? ' active' : ''),
         onclick: () => switchTab(id),
@@ -413,6 +780,7 @@ function viewPanel() {
   const content = el('div', { class: 'tab-content' });
   if (state.tab === 'users') content.append(state.detail ? viewUserDetail() : viewUsers());
   else if (state.tab === 'stats') content.append(viewStats());
+  else if (state.tab === 'log') content.append(viewLog());
   else content.append(viewSettings());
   return el('div', {}, tabs, content);
 }
@@ -422,8 +790,12 @@ function switchTab(id) {
   if (id === 'users') state.detail = null; // Users tab click also acts as "back to list"
   render();
   if (id === 'users' && state.users === null) loadUsers();
-  if (id === 'stats' && state.stats === null) loadStats();
+  if (id === 'stats') {
+    if (state.stats === null) loadStats();
+    if (state.health === null) loadHealth();
+  }
   if (id === 'settings') refreshConfig();
+  if (id === 'log' && state.log === null) loadLog();
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +805,9 @@ function badges(u) {
   const out = [];
   if (u.is_admin) out.push(el('span', { class: 'badge badge-admin', text: 'ADMIN' }));
   if (u.banned) out.push(el('span', { class: 'badge badge-banned', text: 'BANNED' }));
+  if (typeof u.note === 'string' && u.note.trim()) {
+    out.push(el('span', { class: 'badge badge-note', text: '✎ note', title: truncate(u.note, 300) }));
+  }
   return out;
 }
 
@@ -440,6 +815,29 @@ function capOf(u) {
   const defCap = state.config ? state.config.default_daily_scan_cap : null;
   const cap = u.daily_cap != null ? u.daily_cap : defCap;
   return cap != null ? String(cap) : '—';
+}
+
+const USER_SORTS = {
+  email: { get: (u) => (u.email || '').toLowerCase(), dir: 'asc', str: true },
+  created_at: { get: (u) => u.created_at || '', dir: 'desc', str: true },
+  last_active: { get: (u) => lastActive(u) || '', dir: 'desc', str: true },
+  deal_count: { get: (u) => num(u.deal_count), dir: 'desc' },
+  volume_sum: { get: (u) => num(u.volume_sum), dir: 'desc' },
+  scans_30d: { get: (u) => num(u.scans_30d), dir: 'desc' },
+};
+
+function sortedFilteredUsers() {
+  const q = state.usersQuery.trim().toLowerCase();
+  let list = (state.users || []).slice();
+  if (q) list = list.filter((u) => (u.email || '').toLowerCase().includes(q));
+  const s = USER_SORTS[state.usersSort.key] || USER_SORTS.created_at;
+  const mul = state.usersSort.dir === 'asc' ? 1 : -1;
+  list.sort((a, b) => {
+    const av = s.get(a); const bv = s.get(b);
+    const c = s.str ? String(av).localeCompare(String(bv)) : (av - bv);
+    return c * mul;
+  });
+  return list;
 }
 
 function viewUsers() {
@@ -456,36 +854,81 @@ function viewUsers() {
     if (!state.usersError) wrap.append(el('p', { class: 'msg-info', text: 'No users.' }));
     return wrap;
   }
-  const tbl = el('table', {},
-    el('thead', {}, el('tr', {},
-      el('th', { text: 'Email' }),
-      el('th', { text: 'Joined' }),
-      el('th', { text: 'Last active' }),
-      el('th', { class: 'num', text: 'Deals' }),
-      el('th', { class: 'num', text: 'Volume' }),
-      el('th', { class: 'num', text: 'Scans 30d' }),
-      el('th', { class: 'num', text: 'Scans 24h' }))),
-    el('tbody', {}, state.users.map((u) =>
-      el('tr', { class: 'clickable', onclick: () => openDetail(u) },
+
+  const search = el('input', {
+    type: 'text', class: 'input-search', placeholder: 'Search email…',
+  });
+  search.value = state.usersQuery;
+  wrap.append(el('div', { class: 'users-controls' }, search));
+
+  const tbody = el('tbody', {});
+  const countEl = el('p', { class: 'hint' });
+
+  const sortableTh = (key, label, cls) => {
+    const active = state.usersSort.key === key;
+    const arrow = active ? (state.usersSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+    return el('th', {
+      class: 'sortable' + (cls ? ' ' + cls : ''),
+      onclick: () => {
+        if (state.usersSort.key === key) {
+          state.usersSort.dir = state.usersSort.dir === 'asc' ? 'desc' : 'asc';
+        } else {
+          state.usersSort = { key, dir: USER_SORTS[key].dir };
+        }
+        render();
+      },
+    }, label + arrow);
+  };
+
+  const renderRows = () => {
+    tbody.textContent = '';
+    const list = sortedFilteredUsers();
+    countEl.textContent = list.length === state.users.length
+      ? state.users.length + ' users'
+      : list.length + ' of ' + state.users.length + ' users';
+    for (const u of list) {
+      tbody.append(el('tr', { class: 'clickable', onclick: () => openDetail(u) },
         el('td', {}, u.email || '—', badges(u)),
         el('td', { text: fmtDate(u.created_at) }),
         el('td', { text: fmtDateTime(lastActive(u)) }),
         el('td', { class: 'num', text: intFmt(u.deal_count) }),
         el('td', { class: 'num', text: money(u.volume_sum) }),
         el('td', { class: 'num', text: intFmt(u.scans_30d) }),
-        el('td', { class: 'num', text: intFmt(u.scans_24h == null ? 0 : u.scans_24h) + ' / ' + capOf(u) })))));
+        el('td', { class: 'num', text: intFmt(u.scans_24h == null ? 0 : u.scans_24h) + ' / ' + capOf(u) })));
+    }
+    if (!list.length) {
+      tbody.append(el('tr', {}, el('td', { colspan: '7', class: 'msg-info', text: 'No matching users.' })));
+    }
+  };
+
+  // Keystrokes re-render only the table body — the input keeps focus.
+  search.addEventListener('input', () => {
+    state.usersQuery = search.value;
+    renderRows();
+  });
+
+  const tbl = el('table', {},
+    el('thead', {}, el('tr', {},
+      sortableTh('email', 'Email'),
+      sortableTh('created_at', 'Joined'),
+      sortableTh('last_active', 'Last active'),
+      sortableTh('deal_count', 'Deals', 'num'),
+      sortableTh('volume_sum', 'Volume', 'num'),
+      sortableTh('scans_30d', 'Scans 30d', 'num'),
+      el('th', { class: 'num', text: 'Scans 24h' }))),
+    tbody);
+  renderRows();
+  wrap.append(countEl);
   wrap.append(el('div', { class: 'table-wrap' }, tbl));
   return wrap;
 }
 
 // ---------------------------------------------------------------------------
-// User detail
+// User detail — sectioned (Overview / Deals / Activity / Deleted)
 // ---------------------------------------------------------------------------
 function viewUserDetail() {
   const d = state.detail;
   const row = d.row;
-  const isAdmin = !!row.is_admin;
-  const adminTip = 'Admin accounts cannot be banned or deleted';
 
   const back = el('button', {
     class: 'btn-link',
@@ -519,9 +962,41 @@ function viewUserDetail() {
   root.append(el('div', { class: 'detail-head' },
     el('h2', { text: row.email || row.user_id }),
     badgeSlot));
-  const refreshBadges = () => { badgeSlot.textContent = ''; badges(row).forEach((b) => badgeSlot.append(b)); };
 
   if (d.error) root.append(el('p', { class: 'msg msg-err', text: 'Could not load details: ' + d.error }));
+
+  const sections = [['overview', 'Overview'], ['deals', 'Deals'], ['activity', 'Activity'], ['deleted', 'Deleted']];
+  root.append(el('nav', { class: 'subtabs' }, sections.map(([id, label]) =>
+    el('button', {
+      class: 'tab' + (d.section === id ? ' active' : ''),
+      onclick: () => switchSection(id),
+    }, label))));
+
+  if (d.section === 'deals') root.append(sectionDeals(d));
+  else if (d.section === 'activity') root.append(sectionActivity(d));
+  else if (d.section === 'deleted') root.append(sectionDeleted(d));
+  else root.append(sectionOverview(d, badgeSlot));
+
+  return root;
+}
+
+function switchSection(id) {
+  const d = state.detail;
+  if (!d) return;
+  d.section = id;
+  render();
+  if (id === 'deals' && d.deals.rows === null) loadDeals();
+  if (id === 'activity' && d.activity.rows === null) loadActivity();
+  if (id === 'deleted' && d.deletedDeals.rows === null) loadDeletedDeals();
+}
+
+// -- Overview: aggregates + note + settings + cap/pause + actions + delete --
+function sectionOverview(d, badgeSlot) {
+  const row = d.row;
+  const isAdmin = !!row.is_admin;
+  const adminTip = 'Admin accounts cannot be banned or deleted';
+  const root = el('div', {});
+  const refreshBadges = () => { badgeSlot.textContent = ''; badges(row).forEach((b) => badgeSlot.append(b)); };
 
   // -- aggregates --
   const a = Object.assign({}, row, (d.data && d.data.aggregates) || {});
@@ -540,6 +1015,30 @@ function viewUserDetail() {
   root.append(el('dl', { class: 'agg-grid' }, items.map(([k, v]) =>
     el('div', { class: 'agg-item' }, el('dt', { text: k }), el('dd', { text: v })))));
 
+  // -- admin note --
+  root.append(el('h3', { text: 'Admin note' }));
+  const noteArea = el('textarea', { class: 'note-area', rows: '3', placeholder: 'Private operator note for this user' });
+  const noteFromDetail = d.data && d.data.aggregates && typeof d.data.aggregates.note === 'string'
+    ? d.data.aggregates.note : null;
+  noteArea.value = noteFromDetail != null ? noteFromDetail : (typeof row.note === 'string' ? row.note : '');
+  const noteMsg = el('p', { class: 'msg' });
+  const noteSave = el('button', { class: 'btn btn-primary btn-small' }, 'Save note');
+  noteSave.addEventListener('click', async () => {
+    noteSave.disabled = true;
+    setMsg(noteMsg, 'info', 'Saving…');
+    try {
+      await adminApi('set_user_note', { user_id: row.user_id, note: noteArea.value });
+      row.note = noteArea.value;
+      if (d.data && d.data.aggregates) d.data.aggregates.note = noteArea.value;
+      refreshBadges();
+      setMsg(noteMsg, 'ok', noteArea.value.trim() ? 'Note saved.' : 'Note cleared.');
+    } catch (e) {
+      if (!e.handled) setMsg(noteMsg, 'err', e.message);
+    }
+    noteSave.disabled = false;
+  });
+  root.append(noteArea, el('div', { class: 'btn-row' }, noteSave), noteMsg);
+
   // -- user settings (if the backend returned any) --
   const us = d.data && d.data.settings;
   if (us && typeof us === 'object') {
@@ -553,7 +1052,7 @@ function viewUserDetail() {
     }
   }
 
-  // -- scan cap editor --
+  // -- scan cap editor + pause/resume --
   root.append(el('h3', { text: 'Daily scan cap' }));
   const defCap = state.config ? state.config.default_daily_scan_cap : undefined;
   const defLabel = 'default' + (defCap != null ? ' (' + defCap + ')' : ' (unknown)');
@@ -569,24 +1068,34 @@ function viewUserDetail() {
   const capNote = el('input', { type: 'text', class: 'input-note', placeholder: 'Note (optional)' });
   const capSave = el('button', { class: 'btn btn-primary btn-small' }, 'Save');
   const capClear = el('button', { class: 'btn btn-small' }, 'Clear to default');
+  const pauseBtn = el('button', { class: 'btn btn-small' }, '…');
 
-  async function applyCap(value) {
-    capSave.disabled = capClear.disabled = true;
+  const syncPause = () => {
+    const paused = currentCap === 0;
+    pauseBtn.textContent = paused ? 'Resume scanning' : 'Pause scanning';
+    pauseBtn.className = 'btn btn-small' + (paused ? ' btn-primary' : ' btn-danger-outline');
+  };
+  syncPause();
+
+  async function applyCap(value, noteOverride) {
+    capSave.disabled = capClear.disabled = pauseBtn.disabled = true;
     setMsg(capMsg, 'info', 'Saving…');
     try {
       const params = { user_id: row.user_id, daily_cap: value };
-      const noteVal = capNote.value.trim();
+      const noteVal = noteOverride !== undefined ? noteOverride : capNote.value.trim();
       if (noteVal) params.note = noteVal;
       await adminApi('set_scan_cap', params);
       row.daily_cap = value;
       currentCap = value;
       currentLabel.textContent = value != null ? String(value) : defLabel;
       capInput.value = value != null ? String(value) : '';
-      setMsg(capMsg, 'ok', value != null ? 'Cap saved.' : 'Override cleared — using the default cap.');
+      syncPause();
+      setMsg(capMsg, 'ok', value === 0 ? 'Scanning paused (cap 0).'
+        : value != null ? 'Cap saved.' : 'Override cleared — using the default cap.');
     } catch (e) {
       if (!e.handled) setMsg(capMsg, 'err', e.message);
     }
-    capSave.disabled = capClear.disabled = false;
+    capSave.disabled = capClear.disabled = pauseBtn.disabled = false;
   }
 
   capSave.addEventListener('click', () => {
@@ -597,9 +1106,14 @@ function viewUserDetail() {
     applyCap(n);
   });
   capClear.addEventListener('click', () => applyCap(null));
+  pauseBtn.addEventListener('click', () => {
+    const paused = currentCap === 0;
+    applyCap(paused ? null : 0, paused ? undefined : 'paused via panel');
+  });
 
   root.append(el('p', { class: 'hint' }, 'Current: ', currentLabel));
-  root.append(el('div', { class: 'cap-row' }, capInput, capNote, capSave, capClear));
+  root.append(el('div', { class: 'cap-row' }, capInput, capNote, capSave, capClear, pauseBtn));
+  root.append(el('p', { class: 'hint', text: 'Pause sets this user’s cap to 0; Resume clears the override back to the default cap.' }));
   root.append(capMsg);
 
   // -- account actions --
@@ -692,7 +1206,7 @@ function viewUserDetail() {
       try {
         const resp = await adminApi('delete_user', { user_id: row.user_id, confirm_email: emailInput.value });
         state.users = (state.users || []).filter((u) => u.user_id !== row.user_id);
-        d.deleted = (resp && resp.deleted) || {};
+        state.detail.deleted = (resp && resp.deleted) || {};
         render();
       } catch (e) {
         confirmBtn.disabled = emailInput.value !== row.email;
@@ -757,6 +1271,530 @@ function viewUserDetail() {
   return root;
 }
 
+// -- Deals section: server-paginated search/browse --
+function sectionDeals(d) {
+  const s = d.deals;
+  const root = el('div', {});
+
+  const search = el('input', { type: 'text', class: 'input-search', placeholder: 'Owner, account #, or deal id…' });
+  search.value = s.query;
+  const cancelledSel = el('select', { class: 'select-small' },
+    el('option', { value: 'any', text: 'Cancelled: any' }),
+    el('option', { value: 'false', text: 'Non-cancelled' }),
+    el('option', { value: 'true', text: 'Cancelled only' }));
+  cancelledSel.value = s.cancelled;
+  const penderSel = el('select', { class: 'select-small' },
+    el('option', { value: 'any', text: 'Type: any' }),
+    el('option', { value: 'true', text: 'Penders' }),
+    el('option', { value: 'false', text: 'Full downs' }));
+  penderSel.value = s.pender;
+  const go = () => {
+    s.query = search.value;
+    s.cancelled = cancelledSel.value;
+    s.pender = penderSel.value;
+    s.offset = 0;
+    loadDeals();
+  };
+  const searchBtn = el('button', { class: 'btn btn-primary btn-small', onclick: go }, 'Search');
+  search.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  cancelledSel.addEventListener('change', go);
+  penderSel.addEventListener('change', go);
+
+  root.append(el('div', { class: 'deals-controls' }, search, searchBtn, cancelledSel, penderSel));
+  if (s.error) root.append(el('p', { class: 'msg msg-err', text: s.error }));
+  if (s.rows === null) {
+    root.append(el('p', { class: 'msg-info', text: 'Loading deals…' }));
+    return root;
+  }
+  if (!s.rows.length) {
+    root.append(el('p', { class: 'msg-info', text: s.query || s.cancelled !== 'any' || s.pender !== 'any' ? 'No deals match.' : 'No deals.' }));
+    return root;
+  }
+
+  const tbl = el('table', {},
+    el('thead', {}, el('tr', {},
+      el('th', { text: 'Date' }),
+      el('th', { text: 'Owner' }),
+      el('th', { text: 'Account' }),
+      el('th', { class: 'num', text: 'Volume' }),
+      el('th', { class: 'num', text: 'Commission' }),
+      el('th', { text: 'Status' }),
+      el('th', { text: 'Entry' }))),
+    el('tbody', {}, s.rows.map((deal) =>
+      el('tr', { class: 'clickable', onclick: () => openDrawer(deal.id) },
+        el('td', { text: fmtISODate(deal.deal_date) }),
+        el('td', { text: deal.owner_name || '—' }),
+        el('td', { class: 'mono-sm', text: deal.account_number || '—' }),
+        el('td', { class: 'num', text: money(deal.volume) }),
+        el('td', { class: 'num', text: money(deal.commission_amount) }),
+        el('td', {}, dealStatusBadge(deal), sourceBadge(deal.commission_source)),
+        el('td', { text: deal.entry_method || '—' })))));
+  root.append(el('div', { class: 'table-wrap' }, tbl));
+
+  // pagination
+  const from = s.offset + 1;
+  const to = s.offset + s.rows.length;
+  const pager = el('div', { class: 'pager' },
+    el('button', {
+      class: 'btn btn-small', disabled: s.offset === 0,
+      onclick: () => { s.offset = Math.max(0, s.offset - 50); loadDeals(); },
+    }, '‹ Prev'),
+    el('span', { class: 'hint', text: from + '–' + to + ' of ' + intFmt(s.total) }),
+    el('button', {
+      class: 'btn btn-small', disabled: to >= s.total,
+      onclick: () => { s.offset = s.offset + 50; loadDeals(); },
+    }, 'Next ›'));
+  root.append(pager);
+  return root;
+}
+
+// -- Activity section: audit timeline, FIELD NAMES only --
+function sectionActivity(d) {
+  const s = d.activity;
+  const root = el('div', {});
+  root.append(el('p', { class: 'hint', text: 'Row history across deals and settings. Field names only here — open a deal to see value-level diffs.' }));
+  if (s.error) root.append(el('p', { class: 'msg msg-err', text: s.error }));
+  if (s.rows === null) {
+    root.append(el('p', { class: 'msg-info', text: 'Loading activity…' }));
+    return root;
+  }
+  if (!s.rows.length) {
+    root.append(el('p', { class: 'msg-info', text: 'No recorded activity.' }));
+    return root;
+  }
+
+  const items = s.rows.map((a) => {
+    let desc;
+    if (a.action === 'INSERT') desc = el('span', { class: 'tl-created', text: 'row created' });
+    else if (a.action === 'DELETE') desc = el('span', { class: 'tl-deleted', text: 'row deleted' });
+    else {
+      const names = changedFieldNames(a);
+      const shown = names.slice(0, 12).map(humanize).join(', ');
+      const extra = names.length > 12 ? ' +' + (names.length - 12) + ' more' : '';
+      desc = el('span', { class: 'tl-fields', text: names.length ? shown + extra : 'no visible field changes' });
+    }
+    const isDeal = a.table_name === 'deals';
+    return el('li', {
+      class: isDeal ? 'clickable' : null,
+      title: isDeal ? 'Open deal' : null,
+      onclick: isDeal ? () => openDrawer(a.row_id) : null,
+    },
+      el('span', { class: 'tl-time', title: utcStr(a.changed_at), text: fmtDateTime(a.changed_at) }),
+      ' ',
+      el('span', { class: 'badge badge-table', text: a.table_name }),
+      el('span', { class: 'badge badge-action-' + String(a.action).toLowerCase(), text: a.action }),
+      ' ',
+      desc);
+  });
+  root.append(el('ul', { class: 'timeline' }, items));
+
+  if (s.nextBefore) {
+    root.append(el('div', { class: 'load-more' },
+      el('button', {
+        class: 'btn btn-small', disabled: s.loadingMore,
+        onclick: () => loadActivity(true),
+      }, s.loadingMore ? 'Loading…' : 'Load older')));
+  }
+  return root;
+}
+
+// -- Deleted section: DELETE snapshots + restore --
+function sectionDeleted(d) {
+  const s = d.deletedDeals;
+  const root = el('div', {});
+  root.append(el('p', { class: 'hint', text: 'Deals deleted from this account, reconstructable from their audit snapshot.' }));
+  if (s.error) root.append(el('p', { class: 'msg msg-err', text: s.error }));
+  if (s.rows === null) {
+    root.append(el('p', { class: 'msg-info', text: 'Loading deleted deals…' }));
+    return root;
+  }
+  if (!s.rows.length) {
+    root.append(el('p', { class: 'msg-info', text: 'No deleted deals.' }));
+    return root;
+  }
+
+  const restoreMsg = el('p', { class: 'msg' });
+  const confirmSlot = el('div', {});
+
+  const tbl = el('table', {},
+    el('thead', {}, el('tr', {},
+      el('th', { text: 'Deleted' }),
+      el('th', { text: 'Owner' }),
+      el('th', { text: 'Deal date' }),
+      el('th', { class: 'num', text: 'Volume' }),
+      el('th', { class: 'num', text: 'Commission' }),
+      el('th', { text: 'Source' }),
+      el('th', { text: '' }))),
+    el('tbody', {}, s.rows.map((r) =>
+      el('tr', {},
+        el('td', { title: utcStr(r.changed_at), text: fmtDateTime(r.changed_at) }),
+        el('td', {}, r.owner_name || '—',
+          r.cancelled ? el('span', { class: 'badge badge-cancelled', text: 'Cancelled' }) : null),
+        el('td', { text: fmtISODate(r.deal_date) }),
+        el('td', { class: 'num', text: money(r.volume) }),
+        el('td', { class: 'num', text: money(r.commission_amount) }),
+        el('td', {}, sourceBadge(r.commission_source)),
+        el('td', {}, el('button', {
+          class: 'btn btn-small',
+          onclick: () => {
+            confirmSlot.textContent = '';
+            const goBtn = el('button', { class: 'btn btn-primary' }, 'Restore deal');
+            goBtn.addEventListener('click', async () => {
+              goBtn.disabled = true;
+              setMsg(restoreMsg, 'info', 'Restoring…');
+              try {
+                const resp = await adminApi('restore_deal', { deal_id: r.row_id });
+                s.rows = s.rows.filter((x) => x.row_id !== r.row_id);
+                d.deals.rows = null; // deals list is stale now
+                confirmSlot.textContent = '';
+                setMsg(restoreMsg, 'ok', 'Deal restored.');
+                render();
+                openDrawer((resp && resp.deal && resp.deal.id) || r.row_id);
+              } catch (e) {
+                goBtn.disabled = false;
+                if (e.handled) return;
+                const msgs = {
+                  no_snapshot: 'No deletion snapshot exists for this deal.',
+                  already_exists: 'A deal with this id already exists — it was likely already restored.',
+                };
+                setMsg(restoreMsg, 'err', msgs[e.code] || e.message);
+              }
+            });
+            confirmSlot.append(el('div', { class: 'confirm-box' },
+              el('p', { text: 'Restores this deal exactly as it was at deletion, same ID and commission source.' }),
+              el('p', { class: 'hint', text: (r.owner_name || 'Unknown owner') + ' · ' + fmtISODate(r.deal_date) + ' · ' + money(r.volume) }),
+              el('div', { class: 'btn-row' },
+                goBtn,
+                el('button', { class: 'btn', onclick: () => { confirmSlot.textContent = ''; } }, 'Cancel'))));
+          },
+        }, 'Restore…'))))));
+  root.append(el('div', { class: 'table-wrap' }, tbl));
+  root.append(confirmSlot);
+  root.append(restoreMsg);
+  return root;
+}
+
+// ---------------------------------------------------------------------------
+// Deal drawer
+// ---------------------------------------------------------------------------
+function viewDrawer() {
+  const dr = state.drawer;
+  const editing = !!dr.edit;
+
+  const backdrop = el('div', {
+    class: 'drawer-backdrop',
+    onclick: () => { if (!state.drawer.edit) closeDrawer(); },
+  });
+  const panel = el('div', { class: 'drawer' });
+
+  const closeBtn = el('button', { class: 'btn btn-small', onclick: () => {
+    if (state.drawer.edit) return; // editing: use Cancel in the footer
+    closeDrawer();
+  }, text: '✕ Close', disabled: editing, title: editing ? 'Finish or cancel the edit first' : null });
+
+  if (!dr.data && !dr.error) {
+    panel.append(el('div', { class: 'drawer-head' }, el('h2', { text: 'Deal' }), closeBtn));
+    panel.append(el('p', { class: 'msg-info', text: 'Loading deal…' }));
+    return el('div', {}, backdrop, panel);
+  }
+  if (dr.error) {
+    panel.append(el('div', { class: 'drawer-head' }, el('h2', { text: 'Deal' }), closeBtn));
+    panel.append(el('p', { class: 'msg msg-err', text: dr.error }));
+    return el('div', {}, backdrop, panel);
+  }
+
+  const deal = dr.data.deal;
+  const owners = Array.isArray(deal.owner_names) ? deal.owner_names : [];
+  const title = owners.length ? owners.join(', ') : 'Deal';
+
+  const head = el('div', { class: 'drawer-head' },
+    el('div', {},
+      el('h2', { text: title }),
+      el('p', { class: 'drawer-sub mono-sm', text: deal.id || '' })),
+    el('div', { class: 'btn-row' },
+      !editing ? el('button', { class: 'btn btn-primary btn-small', onclick: startEdit }, 'Edit') : null,
+      closeBtn));
+  panel.append(head);
+
+  panel.append(el('div', { class: 'drawer-badges' },
+    dealStatusBadge(deal), sourceBadge(deal.commission_source),
+    el('span', { class: 'badge badge-table', text: deal.entry_method || '—' })));
+
+  if (editing) panel.append(drawerEdit(dr));
+  else panel.append(drawerRead(dr));
+
+  return el('div', {}, backdrop, panel);
+}
+
+function drawerRead(dr) {
+  const deal = dr.data.deal;
+  const root = el('div', {});
+
+  for (const [group, cols] of DEAL_GROUPS) {
+    root.append(el('h4', { class: 'group-head', text: group }));
+    root.append(el('dl', { class: 'agg-grid' }, cols.map((col) =>
+      el('div', { class: 'agg-item' },
+        el('dt', { text: humanize(col) }),
+        el('dd', {
+          class: col === 'id' || col === 'user_id' || col === 'scan_event_id' ? 'mono-sm' : null,
+          text: readValue(col, deal[col]),
+          title: deal[col] != null && typeof deal[col] === 'object' ? truncate(JSON.stringify(deal[col]), 500) : null,
+        })))));
+  }
+
+  // -- linked scan event --
+  if (deal.scan_event_id) {
+    root.append(el('h4', { class: 'group-head', text: 'Scan event' }));
+    const ev = dr.data.scan_event;
+    if (!ev) {
+      root.append(el('p', { class: 'msg-info', text: 'Scan event ' + deal.scan_event_id + ' no longer exists (purged).' }));
+    } else {
+      const items = [
+        ['Time', fmtDateTime(ev.created_at)],
+        ['Status', ev.status || '—'],
+        ['Model', ev.model || '—'],
+        ['Prompt', ev.prompt_version || '—'],
+        ['Tokens in / out', (ev.input_tokens == null ? '—' : intFmt(ev.input_tokens)) + ' / ' + (ev.output_tokens == null ? '—' : intFmt(ev.output_tokens))],
+        ['Duration', fmtDur(ev.duration_ms)],
+        ['Error', ev.error_code || '—'],
+      ];
+      root.append(el('dl', { class: 'agg-grid' }, items.map(([k, v]) =>
+        el('div', { class: 'agg-item' }, el('dt', { text: k }), el('dd', { text: v })))));
+    }
+  }
+
+  // -- per-deal audit timeline with VALUE diffs --
+  root.append(el('h4', { class: 'group-head', text: 'History' }));
+  const audit = dr.data.audit || [];
+  if (!audit.length) {
+    root.append(el('p', { class: 'msg-info', text: 'No audit history (predates the audit trigger).' }));
+  } else {
+    root.append(el('ul', { class: 'timeline' }, audit.map((a) => {
+      const li = el('li', {},
+        el('span', { class: 'tl-time', title: utcStr(a.changed_at), text: fmtDateTime(a.changed_at) }),
+        ' ',
+        el('span', { class: 'badge badge-action-' + String(a.action).toLowerCase(), text: a.action }));
+      if (a.action === 'UPDATE') {
+        const names = changedFieldNames(a);
+        const oldR = a.old_row || {};
+        const newR = a.new_row || {};
+        li.append(el('div', { class: 'tl-diffs' }, names.map((k) =>
+          el('div', { class: 'tl-diff' },
+            el('span', { class: 'tl-field', text: humanize(k) + ': ' }),
+            el('span', { class: 'diff-old', text: fmtVal(oldR[k]) }),
+            ' → ',
+            el('span', { class: 'diff-new', text: fmtVal(newR[k]) })))));
+      } else {
+        li.append(' ', el('span', {
+          class: a.action === 'DELETE' ? 'tl-deleted' : 'tl-created',
+          text: a.action === 'DELETE' ? 'row deleted' : 'row created',
+        }));
+      }
+      return li;
+    })));
+  }
+  return root;
+}
+
+function startEdit() {
+  const dr = state.drawer;
+  if (!dr || !dr.data) return;
+  dr.edit = { values: {}, confirm: '', force: false, msg: '', saving: false };
+  render();
+}
+
+function drawerEdit(dr) {
+  const deal = dr.data.deal;
+  const edit = dr.edit;
+  const root = el('div', {});
+  const imported = deal.commission_source === 'imported';
+
+  // ---- grouped inputs ----
+  for (const [group, cols] of DEAL_GROUPS) {
+    root.append(el('h4', { class: 'group-head', text: group }));
+    const grid = el('div', { class: 'edit-grid' });
+    for (const col of cols) {
+      grid.append(el('label', { class: 'edit-label', text: humanize(col) }));
+      if (IMMUTABLE_COLS.includes(col)) {
+        grid.append(el('span', { class: 'mono-sm ro-val', text: deal[col] == null ? '—' : String(deal[col]) }));
+        continue;
+      }
+      const t = FIELD_TYPES[col] || 'text';
+      const raw = col in edit.values ? edit.values[col] : encodeFieldValue(col, deal[col]);
+      let input;
+      if (Array.isArray(t)) {
+        input = el('select', {}, t.map((opt) =>
+          el('option', { value: opt, text: opt === '' ? '(none)' : opt })));
+        // unknown ≠ default: a NOT NULL enum that is null (legacy) or holds an
+        // out-of-list value renders its ACTUAL state as an extra option — the
+        // select must never quietly display a valid-looking choice.
+        if (raw === '' && !t.includes('')) {
+          input.prepend(el('option', { value: '', text: '(unset)' }));
+        } else if (raw !== '' && !t.includes(raw)) {
+          input.prepend(el('option', { value: raw, text: raw + ' (current)' }));
+        }
+        input.value = raw;
+      } else if (t === 'bool') {
+        input = el('select', {},
+          el('option', { value: 'true', text: 'true' }),
+          el('option', { value: 'false', text: 'false' }));
+        input.value = raw === '' ? 'false' : raw;
+        if (raw === '') { input.prepend(el('option', { value: '', text: '(unset)' })); input.value = ''; }
+      } else if (t === 'bool-null') {
+        input = el('select', {},
+          el('option', { value: '', text: '(null)' }),
+          el('option', { value: 'true', text: 'true' }),
+          el('option', { value: 'false', text: 'false' }));
+        input.value = raw;
+      } else if (t === 'lines') {
+        input = el('textarea', { rows: '3', class: 'edit-area', placeholder: 'one per line' });
+        input.value = raw;
+      } else if (t === 'json' || t === 'json-array') {
+        input = el('textarea', { rows: '4', class: 'edit-area mono-sm', placeholder: t === 'json-array' ? '[]' : 'null' });
+        input.value = raw;
+      } else if (t === 'date') {
+        input = el('input', { type: 'date' });
+        input.value = raw;
+      } else if (t === 'number') {
+        input = el('input', { type: 'number', step: 'any' });
+        input.value = raw;
+      } else {
+        input = el('input', { type: 'text' });
+        input.value = raw;
+      }
+      const evName = input.tagName === 'SELECT' ? 'change' : 'input';
+      input.addEventListener(evName, () => {
+        edit.values[col] = input.value;
+        updateFooter();
+      });
+      if (GUARD_FIELDS.includes(col) && imported) input.classList.add('guard-field');
+      grid.append(input);
+    }
+    root.append(grid);
+  }
+
+  // ---- footer: warnings + diff + confirm + save ----
+  const footer = el('div', { class: 'edit-footer' });
+
+  if (imported) {
+    footer.append(el('div', { class: 'warn-imported' },
+      el('strong', { text: 'PAID-TRUTH DEAL: ' }),
+      'commission figures are payroll ground truth (§3.11c). Changing money/commission fields requires force and breaks reconciliation if wrong.'));
+  } else {
+    footer.append(el('div', { class: 'warn-derived' },
+      'Server edits do NOT recompute derived fields (volume, commission, pender dates). If you change inputs, update derived fields here yourself — or have the rep edit in-app, which recomputes.'));
+  }
+
+  const diffPanel = el('div', { class: 'diff-panel' });
+  footer.append(diffPanel);
+
+  let forceRow = null;
+  let forceCheck = null;
+  if (imported) {
+    forceCheck = el('input', { type: 'checkbox' });
+    forceCheck.checked = edit.force;
+    forceCheck.addEventListener('change', () => { edit.force = forceCheck.checked; updateFooter(); });
+    forceRow = el('label', { class: 'force-row' }, forceCheck,
+      ' Force this edit (force_imported) — required when changing commission-adjacent fields');
+    footer.append(forceRow);
+  }
+
+  const confirmInput = el('input', { type: 'text', class: 'input-small confirm-input', placeholder: 'CONFIRM', autocomplete: 'off' });
+  confirmInput.value = edit.confirm;
+  const saveBtn = el('button', { class: 'btn btn-danger' }, 'Save changes');
+  const cancelBtn = el('button', { class: 'btn', onclick: () => { dr.edit = null; render(); } }, 'Cancel');
+  const saveMsg = el('p', { class: 'msg' });
+  if (edit.msg) setMsg(saveMsg, 'err', edit.msg);
+
+  confirmInput.addEventListener('input', () => {
+    edit.confirm = confirmInput.value;
+    updateFooter();
+  });
+
+  function computePending() {
+    const pending = {};
+    const errors = {};
+    for (const col of Object.keys(edit.values)) {
+      const res = parseFieldValue(col, edit.values[col]);
+      if (res.error) { errors[col] = res.error; continue; }
+      const orig = deal[col] === undefined ? null : deal[col];
+      if (!valueEq(res.value, orig)) pending[col] = res.value;
+    }
+    return { pending, errors };
+  }
+
+  function updateFooter() {
+    const { pending, errors } = computePending();
+    const keys = Object.keys(pending);
+    const errKeys = Object.keys(errors);
+    diffPanel.textContent = '';
+    if (!keys.length && !errKeys.length) {
+      diffPanel.append(el('p', { class: 'hint', text: 'No pending changes.' }));
+    } else {
+      if (keys.length) diffPanel.append(el('p', { class: 'diff-head', text: 'Pending changes (' + keys.length + ')' }));
+      for (const k of keys) {
+        diffPanel.append(el('div', { class: 'diff-row' },
+          el('span', { class: 'tl-field', text: humanize(k) + ': ' }),
+          el('span', { class: 'diff-old', text: fmtVal(deal[k] === undefined ? null : deal[k]) }),
+          ' → ',
+          el('span', { class: 'diff-new', text: fmtVal(pending[k]) }),
+          GUARD_FIELDS.includes(k) && imported
+            ? el('span', { class: 'badge badge-unpaid', text: 'guarded' }) : null));
+      }
+      for (const k of errKeys) {
+        diffPanel.append(el('div', { class: 'diff-row' },
+          el('span', { class: 'tl-field', text: humanize(k) + ': ' }),
+          el('span', { class: 'msg-err', text: errors[k] })));
+      }
+    }
+    const guardTouched = imported && keys.some((k) => GUARD_FIELDS.includes(k));
+    if (forceRow) forceRow.classList.toggle('force-needed', guardTouched && !edit.force);
+    saveBtn.disabled = edit.saving || !keys.length || errKeys.length > 0 || edit.confirm !== 'CONFIRM';
+    return { pending, errors };
+  }
+
+  saveBtn.addEventListener('click', async () => {
+    const { pending, errors } = updateFooter();
+    if (Object.keys(errors).length || !Object.keys(pending).length || edit.confirm !== 'CONFIRM') return;
+    edit.saving = true;
+    saveBtn.disabled = true;
+    cancelBtn.disabled = true;
+    setMsg(saveMsg, 'info', 'Saving…');
+    const params = { deal_id: dr.dealId, fields: pending };
+    if (edit.force) params.force_imported = true;
+    try {
+      const resp = await adminApi('update_deal', params);
+      dr.data.deal = (resp && resp.deal) || dr.data.deal;
+      dr.edit = null;
+      render();
+      refreshDrawerQuiet(dr);       // pull the fresh audit row
+      if (state.detail) loadDeals(true); // keep the table behind in sync
+    } catch (e) {
+      edit.saving = false;
+      cancelBtn.disabled = false;
+      if (e.handled) return;
+      const msgs = {
+        imported_guard: 'Blocked: this deal’s commission figures are imported payroll truth. Check the force box to proceed (imported_guard).',
+        unknown_field: 'The server rejected a field name (unknown_field): ' + e.message,
+        immutable_field: 'id and user_id can never be edited (immutable_field).',
+        invalid_value: 'A value doesn’t fit its column: ' + e.message,
+        deal_not_found: 'This deal no longer exists — it may have been deleted.',
+      };
+      edit.msg = msgs[e.code] || e.message;
+      setMsg(saveMsg, 'err', edit.msg);
+      updateFooter();
+    }
+  });
+
+  footer.append(el('div', { class: 'save-row' },
+    el('span', { class: 'hint', text: 'Type CONFIRM to enable Save:' }),
+    confirmInput, saveBtn, cancelBtn));
+  footer.append(saveMsg);
+  root.append(footer);
+  updateFooter();
+  return root;
+}
+
 function statusClass(s) {
   if (s === 'success') return 'st st-success';
   if (s === 'parse_fail' || s === 'api_fail') return 'st st-fail';
@@ -765,17 +1803,18 @@ function statusClass(s) {
 }
 
 // ---------------------------------------------------------------------------
-// Stats tab
+// Stats tab (scan_stats section unchanged + new Health section)
 // ---------------------------------------------------------------------------
 function viewStats() {
   const wrap = el('div', {},
     el('div', { class: 'section-head' },
       el('h2', { text: 'Scan stats — last 30 days' }),
-      el('button', { class: 'btn btn-small', onclick: () => loadStats() }, 'Refresh')),
+      el('button', { class: 'btn btn-small', onclick: () => { loadStats(); loadHealth(); } }, 'Refresh')),
     el('p', { class: 'hint', text: 'Days in UTC.' }));
   if (state.statsError) wrap.append(el('p', { class: 'msg msg-err', text: state.statsError }));
   if (state.stats === null) {
     wrap.append(el('p', { class: 'msg-info', text: 'Loading stats…' }));
+    wrap.append(viewHealth());
     return wrap;
   }
   const rows = state.stats;
@@ -851,6 +1890,110 @@ function viewStats() {
       el('td', { class: 'num', text: intFmt(totals.tokens_out) }),
       el('td', { class: 'num', text: totals.hasCost ? fmtCost(totals.cost) : '' }))));
   wrap.append(el('div', { class: 'table-wrap' }, tbl));
+
+  wrap.append(viewHealth());
+  return wrap;
+}
+
+// Zero-fill health daily rows to a continuous 30-day UTC series.
+function zeroFillHealth(daily, days) {
+  const byDay = new Map(daily.map((r) => [String(r.date || '').slice(0, 10), r]));
+  const out = [];
+  const now = new Date();
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i));
+    const key = d.toISOString().slice(0, 10);
+    out.push(byDay.get(key) || {
+      date: key, total: 0, success: 0, parse_fail: 0, api_fail: 0,
+      blocked_quota: 0, blocked_kill_switch: 0, recovered_count: 0,
+      p50_duration_ms: null, p95_duration_ms: null,
+    });
+  }
+  return out;
+}
+
+function viewHealth() {
+  const wrap = el('div', { class: 'health-section' },
+    el('h2', { text: 'Health — last 30 days' }));
+  if (state.healthError) wrap.append(el('p', { class: 'msg msg-err', text: state.healthError }));
+  if (state.health === null) {
+    wrap.append(el('p', { class: 'msg-info', text: 'Loading health…' }));
+    return wrap;
+  }
+  const h = state.health;
+
+  // -- daily latency / failure-rate table --
+  const daily = zeroFillHealth(h.daily, 30);
+  wrap.append(el('h3', { text: 'Daily latency & failure rate' }));
+  wrap.append(el('div', { class: 'table-wrap' }, el('table', {},
+    el('thead', {}, el('tr', {},
+      el('th', { text: 'Day (UTC)' }),
+      el('th', { class: 'num', text: 'Total' }),
+      el('th', { class: 'num', text: 'Failures' }),
+      el('th', { class: 'num', text: 'Fail rate' }),
+      el('th', { class: 'num', text: 'Blocked' }),
+      el('th', { class: 'num', text: 'Recovered' }),
+      el('th', { class: 'num', text: 'p50' }),
+      el('th', { class: 'num', text: 'p95' }))),
+    el('tbody', {}, daily.map((r) => {
+      const failures = num(r.parse_fail) + num(r.api_fail);
+      const blocked = num(r.blocked_quota) + num(r.blocked_kill_switch);
+      return el('tr', {},
+        el('td', { text: r.date }),
+        el('td', { class: 'num', text: intFmt(r.total) }),
+        el('td', { class: 'num', text: intFmt(failures) }),
+        el('td', { class: 'num', text: r.total > 0 ? pctFmt(failures / r.total) : '—' }),
+        el('td', { class: 'num', text: intFmt(blocked) }),
+        el('td', { class: 'num', text: intFmt(r.recovered_count) }),
+        el('td', { class: 'num', text: fmtDur(r.p50_duration_ms) }),
+        el('td', { class: 'num', text: fmtDur(r.p95_duration_ms) }));
+    })))));
+
+  // -- prompt_version × model breakdown --
+  wrap.append(el('h3', { text: 'By prompt version × model' }));
+  if (!h.by_version.length) {
+    wrap.append(el('p', { class: 'msg-info', text: 'No scan events in the window.' }));
+  } else {
+    wrap.append(el('div', { class: 'table-wrap' }, el('table', {},
+      el('thead', {}, el('tr', {},
+        el('th', { text: 'Prompt' }),
+        el('th', { text: 'Model' }),
+        el('th', { class: 'num', text: 'Total' }),
+        el('th', { class: 'num', text: 'Success rate' }),
+        el('th', { class: 'num', text: 'Recovered' }),
+        el('th', { class: 'num', text: 'Avg tokens in' }),
+        el('th', { class: 'num', text: 'Avg tokens out' }))),
+      el('tbody', {}, h.by_version.map((v) =>
+        el('tr', {},
+          el('td', { text: v.prompt_version || '—' }),
+          el('td', { text: v.model || '—' }),
+          el('td', { class: 'num', text: intFmt(v.total) }),
+          el('td', { class: 'num', text: pctFmt(v.success_rate) }),
+          el('td', { class: 'num', text: intFmt(v.recovered_count) }),
+          el('td', { class: 'num', text: intFmt(v.avg_input_tokens) }),
+          el('td', { class: 'num', text: intFmt(v.avg_output_tokens) })))))));
+  }
+
+  // -- recent failures feed --
+  wrap.append(el('h3', { text: 'Recent failures (last 25, all time)' }));
+  if (!h.recent_failures.length) {
+    wrap.append(el('p', { class: 'msg-info', text: 'No failures recorded.' }));
+  } else {
+    wrap.append(el('div', { class: 'table-wrap' }, el('table', {},
+      el('thead', {}, el('tr', {},
+        el('th', { text: 'Time' }),
+        el('th', { text: 'Email' }),
+        el('th', { text: 'Status' }),
+        el('th', { text: 'Error' }),
+        el('th', { class: 'num', text: 'Duration' }))),
+      el('tbody', {}, h.recent_failures.map((r) =>
+        el('tr', {},
+          el('td', { title: utcStr(r.created_at), text: fmtDateTime(r.created_at) }),
+          el('td', { text: r.email || '—' }),
+          el('td', {}, el('span', { class: statusClass(r.status), text: r.status || '—' })),
+          el('td', { text: r.error_code || '' }),
+          el('td', { class: 'num', text: fmtDur(r.duration_ms) })))))));
+  }
   return wrap;
 }
 
@@ -987,6 +2130,60 @@ function viewSettings() {
       el('div', { class: 'cap-row' }, capInput, capSave, capMsg))));
 
   wrap.append(setMsgEl);
+  return wrap;
+}
+
+// ---------------------------------------------------------------------------
+// Log tab — admin actions
+// ---------------------------------------------------------------------------
+function paramsCompact(p) {
+  if (!p || typeof p !== 'object') return '—';
+  const entries = Object.entries(p);
+  if (!entries.length) return '—';
+  return entries.map(([k, v]) =>
+    k + '=' + (v !== null && typeof v === 'object' ? JSON.stringify(v) : String(v))).join('  ');
+}
+
+function viewLog() {
+  const wrap = el('div', {},
+    el('div', { class: 'section-head' },
+      el('h2', { text: 'Admin actions log' }),
+      el('button', { class: 'btn btn-small', onclick: () => loadLog() }, 'Refresh')),
+    el('p', { class: 'hint', text: 'Every mutating admin-api action, newest first. Params carry field names and counts — values live in the audit history.' }));
+  if (state.logError) wrap.append(el('p', { class: 'msg msg-err', text: state.logError }));
+  if (state.log === null) {
+    wrap.append(el('p', { class: 'msg-info', text: 'Loading log…' }));
+    return wrap;
+  }
+  const rows = state.log.rows;
+  if (!rows.length) {
+    wrap.append(el('p', { class: 'msg-info', text: 'No admin actions recorded yet.' }));
+    return wrap;
+  }
+  const tbl = el('table', {},
+    el('thead', {}, el('tr', {},
+      el('th', { text: 'Time' }),
+      el('th', { text: 'Admin' }),
+      el('th', { text: 'Action' }),
+      el('th', { text: 'Target' }),
+      el('th', { text: 'Params' }))),
+    el('tbody', {}, rows.map((r) => {
+      const target = r.target_email
+        || (r.target_user_id ? truncate(r.target_user_id, 13) : null)
+        || r.target_id || '—';
+      const compact = paramsCompact(r.params);
+      return el('tr', {},
+        el('td', { title: utcStr(r.created_at), text: fmtDateTime(r.created_at) }),
+        el('td', { text: r.admin_email || truncate(r.admin_user_id || '—', 13) }),
+        el('td', {}, el('span', { class: 'badge badge-table', text: r.action })),
+        el('td', { text: target, title: r.target_user_id || null }),
+        el('td', { class: 'params-cell', text: truncate(compact, 160), title: compact === '—' ? null : compact }));
+    })));
+  wrap.append(el('div', { class: 'table-wrap' }, tbl));
+  if (state.log.nextBefore) {
+    wrap.append(el('div', { class: 'load-more' },
+      el('button', { class: 'btn btn-small', onclick: () => loadLog(true) }, 'Load older')));
+  }
   return wrap;
 }
 
