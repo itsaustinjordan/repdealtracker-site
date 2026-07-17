@@ -136,6 +136,10 @@ kbd {
   position: sticky; top: 0; z-index: 30;
   display: flex; align-items: center; gap: var(--sp-3);
   padding: var(--sp-3) var(--sp-6);
+  /* Installed-PWA (viewport-fit=cover): keep the bar clear of the notch/
+     status bar. Plain padding above is the fallback for browsers without
+     env(). */
+  padding-top: calc(var(--sp-3) + env(safe-area-inset-top, 0px));
   background: color-mix(in srgb, var(--bg) 82%, transparent);
   -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
@@ -694,7 +698,10 @@ th.sortable:hover { color: var(--text); }
   }
   #shell.nav-open #sidebar { transform: none; }
   #app { padding: var(--sp-4) var(--sp-4) 80px; }
-  #topbar { padding: var(--sp-2) var(--sp-4); }
+  #topbar {
+    padding: var(--sp-2) var(--sp-4);
+    padding-top: calc(var(--sp-2) + env(safe-area-inset-top, 0px));
+  }
   .search-fake { min-width: 0; flex: 1; }
   .search-fake-kbd { display: none; }
 }
