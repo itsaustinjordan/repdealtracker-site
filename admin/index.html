@@ -7,7 +7,15 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- ZOOM LOCK (admin panel only — the public pages stay zoomable): pinned
+     scale keeps the app-like layout from being pinched/double-tap zoomed.
+     Accessibility tradeoff accepted for an internal admin tool (low-vision
+     users lose page zoom; text size prefs still apply). Note: Safari in the
+     BROWSER may still allow pinch despite user-scalable=no (an iOS
+     accessibility override); the installed PWA locks fully. The companion
+     fix for iOS FOCUS zoom is the ≥16px mobile form-control font-size in
+     style.css — small fonts on focused inputs are what trigger it. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
 <meta name="robots" content="noindex, nofollow">
 <title>Deal Tracker — Admin</title>
 
@@ -25,7 +33,7 @@
 <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
 <link rel="icon" href="/favicon.ico" sizes="any">
 
-<link rel="stylesheet" href="style.css?v=3">
+<link rel="stylesheet" href="style.css?v=4">
 <script>
 // Theme boot — runs before first paint so there is no flash. Manual choice
 // (localStorage) wins; otherwise follow the system (prefers-color-scheme).
@@ -46,7 +54,7 @@
   <div id="shell">
     <aside id="sidebar" aria-label="Navigation">
       <div class="side-brand">
-        <span class="side-brand-mark" aria-hidden="true"></span>
+        <img class="brand-logo" src="/android-chrome-192x192.png" alt="" width="26" height="26">
         <span class="side-brand-text">Deal Tracker <span class="side-brand-sub">Admin</span></span>
       </div>
       <nav id="sidenav" class="side-nav"></nav>
@@ -56,6 +64,12 @@
     <div id="main-col">
       <header id="topbar">
         <button id="nav-toggle" class="btn btn-ghost btn-icon" type="button" aria-label="Menu" hidden>☰</button>
+        <!-- Top-bar brand: shown on mobile, where the sidebar brand is
+             off-canvas; the desktop top bar defers to the sidebar's. -->
+        <span class="topbar-brand">
+          <img class="brand-logo" src="/android-chrome-192x192.png" alt="" width="22" height="22">
+          <span class="topbar-brand-text">Deal Tracker <span class="side-brand-sub">Admin</span></span>
+        </span>
         <button id="search-open" class="search-fake" type="button" hidden>
           <span class="search-fake-icon" aria-hidden="true">⌕</span>
           <span class="search-fake-label">Search users &amp; deals…</span>
@@ -73,7 +87,7 @@
   <div id="toasts" aria-live="polite"></div>
   <div id="layer"></div>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="core.js?v=3"></script>
-  <script src="views.js?v=3"></script>
+  <script src="core.js?v=4"></script>
+  <script src="views.js?v=4"></script>
 </body>
 </html>

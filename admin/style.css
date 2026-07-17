@@ -99,6 +99,11 @@ body {
   line-height: 1.45;
   background: var(--bg);
   color: var(--text);
+  /* Zoom lock, part 2 (with the viewport meta): kills the 350ms double-tap
+     delay AND double-tap zoom. Accessibility tradeoff accepted for an
+     internal admin tool; Safari-in-browser may still allow pinch (iOS
+     accessibility override) — the installed PWA locks fully. */
+  touch-action: manipulation;
 }
 h1, h2, h3, h4 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
 h1 { font-size: var(--fs-xl); }
@@ -159,17 +164,8 @@ kbd {
   display: flex; align-items: center; gap: 10px;
   padding: var(--sp-5) var(--sp-4) var(--sp-4);
 }
-.side-brand-mark {
-  width: 26px; height: 26px; border-radius: 8px; flex: 0 0 26px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
-  position: relative;
-}
-.side-brand-mark::after {
-  content: ""; position: absolute; left: 6px; right: 6px; bottom: 6px; top: 6px;
-  background: #fff;
-  clip-path: polygon(0 55%, 21% 55%, 21% 100%, 39% 100%, 39% 25%, 60% 25%, 60% 100%, 78% 100%, 78% 0, 100% 0, 100% 100%, 0 100%);
-  opacity: 0.95;
-}
+/* The real app icon (192px source rendered small = crisp on retina). */
+.brand-logo { border-radius: 7px; display: block; flex: 0 0 auto; }
 .side-brand-text { font-size: var(--fs-md); font-weight: 700; letter-spacing: -0.01em; }
 .side-brand-sub { color: var(--text-3); font-weight: 600; }
 .side-nav { display: flex; flex-direction: column; gap: 2px; padding: 0 var(--sp-2); }
@@ -188,6 +184,13 @@ kbd {
 .side-foot { margin-top: auto; padding: var(--sp-4); color: var(--text-3); font-size: var(--fs-xs); }
 #sidebar-backdrop {
   position: fixed; inset: 0; background: var(--backdrop); z-index: 39;
+}
+
+/* topbar brand — mobile only (the desktop top bar defers to the sidebar's) */
+.topbar-brand { display: none; align-items: center; gap: 8px; min-width: 0; }
+.topbar-brand-text {
+  font-size: var(--fs-sm); font-weight: 700; letter-spacing: -0.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
 /* topbar search button */
@@ -702,8 +705,22 @@ th.sortable:hover { color: var(--text); }
     padding: var(--sp-2) var(--sp-4);
     padding-top: calc(var(--sp-2) + env(safe-area-inset-top, 0px));
   }
-  .search-fake { min-width: 0; flex: 1; }
-  .search-fake-kbd { display: none; }
+  /* Brand takes the top bar on mobile; search collapses to its icon. */
+  .topbar-brand { display: flex; flex: 1; }
+  .search-fake { min-width: 0; flex: 0 0 auto; padding: 7px 9px; }
+  .search-fake-label, .search-fake-kbd { display: none; }
+  .topbar-spacer { display: none; }
+
+  /* iOS FOCUS-ZOOM fix: Safari zooms the page when a focused text control's
+     font-size is under 16px. Every input/select/textarea is pinned to 16px
+     on mobile — this, not the viewport lock, is what stops the focus zoom.
+     Buttons are deliberately NOT bumped: they can never trigger focus zoom,
+     and 16px would break the compact controls (tooltip dots, small buttons). */
+  input[type="text"], input[type="email"], input[type="password"],
+  input[type="number"], input[type="date"], input[type="url"],
+  select, textarea, .search-input-row input {
+    font-size: 16px;
+  }
 }
 @media (min-width: 901px) {
   #nav-toggle { display: none !important; }
