@@ -2398,8 +2398,13 @@ function ccMinBuild() {
 function ccWhatsNew() {
   const v = C.clientConfig ? C.clientConfig.whats_new : undefined;
   if (!v || typeof v !== 'object') return undefined;
-  if (!Number.isInteger(v.build) || !Array.isArray(v.items)) return undefined;
-  return v;
+  if (!Array.isArray(v.items)) return undefined;
+  // VERSION-keyed (current shape) or legacy BUILD-keyed (a pre-re-key row) —
+  // both render, so the composer is never disabled against the old live
+  // value; it always WRITES version-keyed.
+  if (typeof v.version === 'string') return v;
+  if (Number.isInteger(v.build)) return v;
+  return undefined;
 }
 
 function settingsApp() {
@@ -2524,28 +2529,32 @@ function settingsApp() {
   mbWrap.append(mbMain);
   card.append(mbWrap);
 
-  // ---- what's-new composer ----
+  // ---- what's-new composer (VERSION-keyed — the EAS Update re-key) ----
   const wn = ccWhatsNew();
   const wnWrap = el('div', { class: 'setting-row' });
   const wnMain = el('div', { class: 'setting-main' },
-    el('span', { class: 'strong' }, 'What’s new ', tip('A one-time “What’s new” popup shown to users running EXACTLY this build number — write it when you ship a build. Each user sees it once.')));
+    el('span', { class: 'strong' }, 'What’s new ', tip('A one-time “What’s new” popup. It shows once to each user after they receive this version — whether it arrived as an App Store/TestFlight install or as an over-the-air fix. Write it when you release.')));
   if (!wn) {
     wnMain.append(el('span', { class: 'msg msg-err', text: 'Unknown — the backend value for “whats_new” is missing or malformed. Composer disabled.' }));
   } else {
-    const buildIn = el('input', { type: 'number', min: '0', step: '1', class: 'input-small', value: String(wn.build) });
+    // Prefill from a version-keyed row; a LEGACY build-keyed row prefills
+    // empty (the next save publishes version-keyed — apps ignore old rows).
+    const versionIn = el('input', { type: 'text', class: 'input-small', placeholder: '1.1.0',
+      value: typeof wn.version === 'string' ? wn.version : '' });
     const itemsIn = el('textarea', { rows: '4', style: 'width:100%', placeholder: 'One bullet per line' });
     itemsIn.value = (wn.items || []).join('\n');
     const wnMsg = el('p', { class: 'msg' });
     const wnSave = el('button', { class: 'btn btn-primary btn-small' }, 'Save what’s-new');
     wnSave.addEventListener('click', async () => {
-      const build = Number(buildIn.value);
-      if (!Number.isInteger(build) || build < 0) { setMsg(wnMsg, 'err', 'Build must be a non-negative whole number.'); return; }
+      const version = versionIn.value.trim();
+      // Semver-ish: digits.digits.digits — matches the app's marketing version.
+      if (!/^\d+\.\d+\.\d+$/.test(version)) { setMsg(wnMsg, 'err', 'Version must look like 1.1.0 (the app’s marketing version).'); return; }
       const items = itemsIn.value.split('\n').map((s) => s.trim()).filter(Boolean);
       wnSave.disabled = true;
       setMsg(wnMsg, 'info', 'Saving…');
       try {
-        await adminApi('set_client_config', { key: 'whats_new', value: { build, items } });
-        setMsg(wnMsg, 'ok', 'Saved — users on build ' + build + ' see ' + items.length + ' bullet(s), once each.');
+        await adminApi('set_client_config', { key: 'whats_new', value: { version, items } });
+        setMsg(wnMsg, 'ok', 'Saved — users on v' + version + ' see ' + items.length + ' bullet(s), once each.');
         loadClientConfig(true);
       } catch (e) {
         if (!e.handled) setMsg(wnMsg, 'err', e.message);
@@ -2553,7 +2562,10 @@ function settingsApp() {
       wnSave.disabled = false;
     });
     wnMain.append(
-      el('div', { class: 'row' }, el('span', { class: 'small', text: 'For build' }), buildIn, wnSave),
+      el('div', { class: 'row' },
+        el('span', { class: 'small', text: 'Version (e.g. 1.1.0) ' },
+          tip('The app’s marketing version this note belongs to — shown once to each user after they receive this version. Find it in app.json (“version”) or Settings inside the app. Not the TestFlight build number.')),
+        versionIn, wnSave),
       itemsIn, wnMsg);
   }
   wnWrap.append(wnMain);
