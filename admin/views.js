@@ -1828,9 +1828,26 @@ function drawerEdit(dr) {
 function statsBlank(key) {
   return {
     date: key, total: 0, success: 0, parse_fail: 0, api_fail: 0,
-    blocked_quota: 0, blocked_kill_switch: 0, recovered_count: 0,
+    blocked_quota: 0, blocked_kill_switch: 0, blocked_budget: 0, recovered_count: 0,
     input_tokens: 0, output_tokens: 0, est_cost_usd: null,
   };
+}
+
+// Blocked cell: the derived TOTAL (total − success − failures, so an unknown
+// future blocked status still counts) with a compact per-reason subline from
+// the named counters; "other" appears only if the named ones don't cover it.
+function blockedCell(total, quota, kill, budget) {
+  const cell = el('span', {}, intFmt(total));
+  if (total > 0) {
+    const parts = [];
+    if (quota) parts.push('quota ' + intFmt(quota));
+    if (kill) parts.push('switch ' + intFmt(kill));
+    if (budget) parts.push('budget ' + intFmt(budget));
+    const other = total - quota - kill - budget;
+    if (other > 0) parts.push('other ' + intFmt(other));
+    if (parts.length) cell.append(el('span', { class: 'cell-sub', text: parts.join(' · ') }));
+  }
+  return cell;
 }
 
 function viewStats() {
@@ -1850,9 +1867,13 @@ function viewStats() {
     total: num(r.total),
     success: num(r.success),
     failures: num(r.parse_fail) + num(r.api_fail),
-    // "blocked/other" = everything that isn't success or a failure, so newer
-    // blocked statuses (e.g. the budget breaker) are never silently dropped.
+    // "blocked" = everything that isn't success or a failure, so an unknown
+    // future blocked status is never silently dropped; the named counters
+    // below feed the per-reason breakdown subline.
     blocked: Math.max(0, num(r.total) - num(r.success) - num(r.parse_fail) - num(r.api_fail)),
+    blocked_quota: num(r.blocked_quota),
+    blocked_kill_switch: num(r.blocked_kill_switch),
+    blocked_budget: num(r.blocked_budget),
     recovered: num(r.recovered_count != null ? r.recovered_count : r.recovered),
     tokens_in: num(r.input_tokens),
     tokens_out: num(r.output_tokens),
@@ -1871,17 +1892,18 @@ function viewStats() {
   const totals = rows.reduce((acc, r) => {
     acc.total += r.total; acc.success += r.success; acc.failures += r.failures;
     acc.blocked += r.blocked; acc.recovered += r.recovered;
+    acc.bQuota += r.blocked_quota; acc.bKill += r.blocked_kill_switch; acc.bBudget += r.blocked_budget;
     acc.tokens_in += r.tokens_in; acc.tokens_out += r.tokens_out;
     if (r.est_cost_usd != null) { acc.cost += r.est_cost_usd; acc.hasCost = true; }
     return acc;
-  }, { total: 0, success: 0, failures: 0, blocked: 0, recovered: 0, tokens_in: 0, tokens_out: 0, cost: 0, hasCost: false });
+  }, { total: 0, success: 0, failures: 0, blocked: 0, bQuota: 0, bKill: 0, bBudget: 0, recovered: 0, tokens_in: 0, tokens_out: 0, cost: 0, hasCost: false });
 
   const tfoot = el('tfoot', {}, el('tr', {},
     el('th', { text: 'Total' }),
     el('td', { class: 'num', text: intFmt(totals.total) }),
     el('td', { class: 'num', text: intFmt(totals.success) }),
     el('td', { class: 'num', text: intFmt(totals.failures) }),
-    el('td', { class: 'num', text: intFmt(totals.blocked) }),
+    el('td', { class: 'num' }, blockedCell(totals.blocked, totals.bQuota, totals.bKill, totals.bBudget)),
     el('td', { class: 'num', text: intFmt(totals.recovered) }),
     el('td', { class: 'num', text: intFmt(totals.tokens_in) }),
     el('td', { class: 'num', text: intFmt(totals.tokens_out) }),
@@ -1893,14 +1915,18 @@ function viewStats() {
       { label: 'Total', cls: 'num' },
       { label: 'Success', cls: 'num' },
       { label: 'Failures', cls: 'num', tip: 'Scans that ran but produced no usable result — parse failures plus API errors.' },
-      { label: 'Blocked', cls: 'num', tip: 'Attempts stopped before running: daily quota, the kill switch, or the monthly budget.' },
+      { label: 'Blocked', cls: 'num', tip: 'Attempts stopped before running: daily quota, the kill switch, or the monthly budget. The subline splits the reasons.' },
       { label: 'Recovered', cls: 'num', tip: 'Images that failed once and succeeded on the automatic retry.' },
       { label: 'Tokens in', cls: 'num' },
       { label: 'Tokens out', cls: 'num' },
       { label: 'Est. cost', cls: 'num', tip: 'Estimated Claude spend from token counts at current pricing. “—” = a day with usage the pricing map couldn’t cost.' },
     ],
-    rows.map((r) => ({
-      cells: [r.date, intFmt(r.total), intFmt(r.success), intFmt(r.failures), intFmt(r.blocked),
+    // NEWEST FIRST — today (where fresh activity lands, e.g. the blocked
+    // drills) must be the first row, not buried 30 rows deep in the scroll.
+    // The chart above stays chronological; `rows` order is untouched.
+    rows.slice().reverse().map((r) => ({
+      cells: [r.date, intFmt(r.total), intFmt(r.success), intFmt(r.failures),
+        blockedCell(r.blocked, r.blocked_quota, r.blocked_kill_switch, r.blocked_budget),
         intFmt(r.recovered), intFmt(r.tokens_in), intFmt(r.tokens_out),
         r.est_cost_usd == null ? (r.total ? '—' : '') : fmtCost(r.est_cost_usd)],
     })), { tfoot });
@@ -1916,7 +1942,7 @@ function viewStats() {
 
   const hDaily = zeroFillDays(h.daily, 30, 'date', (key) => ({
     date: key, total: 0, success: 0, parse_fail: 0, api_fail: 0,
-    blocked_quota: 0, blocked_kill_switch: 0, recovered_count: 0,
+    blocked_quota: 0, blocked_kill_switch: 0, blocked_budget: 0, recovered_count: 0,
     p50_duration_ms: null, p95_duration_ms: null,
   }));
 
@@ -2237,7 +2263,12 @@ function viewLog() {
         onclick: r.target_user_id ? () => nav('user/' + r.target_user_id + '/overview') : null,
         cells: [
           relTimeEl(r.created_at),
-          r.admin_email || truncate(r.admin_user_id || '—', 13),
+          // Snapshot email survives account deletion (the server COALESCEs
+          // live-join → write-time snapshot); the marker says why there's no
+          // live account behind it.
+          el('span', {},
+            r.admin_email || truncate(r.admin_user_id || '—', 13),
+            r.admin_deleted ? el('span', { class: 'muted small', text: ' (deleted account)' }) : null),
           el('span', { class: 'badge badge-neutral', text: r.action }),
           el('span', { text: target, title: r.target_user_id || null }),
           el('span', { class: 'params-cell', text: truncate(compact, 160), title: compact === '—' ? null : compact }),
@@ -2537,6 +2568,13 @@ function settingsApp() {
   if (!wn) {
     wnMain.append(el('span', { class: 'msg msg-err', text: 'Unknown — the backend value for “whats_new” is missing or malformed. Composer disabled.' }));
   } else {
+    // The memory-jog: what's live RIGHT NOW, before composing the next one.
+    const publishedLine = el('span', { class: 'field-hint', text:
+      !Array.isArray(wn.items) || wn.items.length === 0
+        ? 'Currently published: none yet'
+        : typeof wn.version === 'string'
+          ? 'Currently published: v' + wn.version + ' · ' + wn.items.length + ' item(s)'
+          : 'Currently published: legacy build ' + wn.build + ' · ' + wn.items.length + ' item(s) — ignored by version-keyed apps' });
     // Prefill from a version-keyed row; a LEGACY build-keyed row prefills
     // empty (the next save publishes version-keyed — apps ignore old rows).
     const versionIn = el('input', { type: 'text', class: 'input-small', placeholder: '1.1.0',
@@ -2562,6 +2600,7 @@ function settingsApp() {
       wnSave.disabled = false;
     });
     wnMain.append(
+      publishedLine,
       el('div', { class: 'row' },
         el('span', { class: 'small', text: 'Version (e.g. 1.1.0) ' },
           tip('The app’s marketing version this note belongs to — shown once to each user after they receive this version. Find it in app.json (“version”) or Settings inside the app. Not the TestFlight build number.')),

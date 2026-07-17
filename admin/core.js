@@ -219,10 +219,84 @@ const valueEq = (a, b) =>
 
 const num = (v) => (v == null ? 0 : Number(v) || 0);
 
-// The ? tooltip (CLARITY RULE): a plain-English explanation on hover/focus.
-function tip(text, left) {
-  return el('button', { class: 'tip' + (left ? ' tip-left' : ''), type: 'button', 'data-tip': text, 'aria-label': text, text: '?' });
+// The ? tooltip (CLARITY RULE): a plain-English explanation on hover,
+// keyboard focus, or tap. The BUBBLE is one shared element appended to
+// <body>, position:fixed and JS-placed from the trigger's
+// getBoundingClientRect (the chart-tooltip pattern): an absolutely-
+// positioned ::after inside .table-wrap { overflow:auto } (or any clipping
+// ancestor) gets cut off, while a body-level fixed element escapes every
+// clip WITHOUT loosening the overflow containment. Never a horizontal-
+// overflow source: display:none at rest, width capped to the viewport
+// (§9 clamp, in CSS), and position clamped here.
+function tip(text) {
+  return el('button', { class: 'tip', type: 'button', 'data-tip': text, 'aria-label': text, text: '?' });
 }
+
+let tipBubble = null;
+let tipTrigger = null;     // the .tip currently showing
+let tipShownByTap = false; // tap toggles; hover never does
+
+function hideTipBubble() {
+  if (tipBubble) tipBubble.style.display = 'none';
+  tipTrigger = null;
+  tipShownByTap = false;
+}
+
+function showTipBubble(trigger, byTap) {
+  const text = trigger.getAttribute('data-tip');
+  if (!text) return;
+  if (!tipBubble) {
+    tipBubble = el('div', { class: 'tip-bubble', role: 'tooltip' });
+    document.body.append(tipBubble);
+  }
+  tipBubble.textContent = text;
+  tipBubble.style.display = 'block';
+  // Measure AFTER the text is set, then clamp into the viewport.
+  const r = trigger.getBoundingClientRect();
+  const bw = tipBubble.offsetWidth;
+  const bh = tipBubble.offsetHeight;
+  let left = r.left + r.width / 2 - bw / 2;
+  left = Math.max(12, Math.min(left, window.innerWidth - bw - 12));
+  let top = r.top - bh - 8;        // prefer above the trigger
+  if (top < 8) top = r.bottom + 8; // flip below near the viewport top
+  tipBubble.style.left = left + 'px';
+  tipBubble.style.top = top + 'px';
+  tipTrigger = trigger;
+  tipShownByTap = !!byTap;
+}
+
+// Delegated once, document-wide. Hover uses pointer events gated to
+// mouse/pen so a TAP doesn't pre-show via synthetic hover and instantly
+// re-hide on its click; touch gets show-on-tap, toggle-off on re-tap,
+// dismiss on outside tap or any scroll.
+document.addEventListener('pointerover', (e) => {
+  if (e.pointerType === 'touch') return;
+  const t = e.target instanceof Element ? e.target.closest('.tip') : null;
+  if (t) showTipBubble(t, false);
+});
+document.addEventListener('pointerout', (e) => {
+  if (e.pointerType === 'touch') return;
+  if (e.target instanceof Element && e.target.closest('.tip')) hideTipBubble();
+});
+document.addEventListener('focusin', (e) => {
+  const t = e.target instanceof Element ? e.target.closest('.tip') : null;
+  if (t) showTipBubble(t, false);
+});
+document.addEventListener('focusout', (e) => {
+  if (e.target instanceof Element && e.target.closest('.tip')) hideTipBubble();
+});
+document.addEventListener('click', (e) => {
+  const t = e.target instanceof Element ? e.target.closest('.tip') : null;
+  if (t) {
+    if (tipTrigger === t && tipShownByTap) hideTipBubble();
+    else showTipBubble(t, true);
+  } else if (tipTrigger) {
+    hideTipBubble();
+  }
+});
+// Any scroll (including inside .table-wrap — capture phase) moves the
+// trigger out from under the fixed bubble; hide rather than track.
+document.addEventListener('scroll', () => { if (tipTrigger) hideTipBubble(); }, true);
 
 // get_config → typed map. Every consumer routes through configToMap /
 // normalizeConfig; a key missing from the map means UNKNOWN — the caller

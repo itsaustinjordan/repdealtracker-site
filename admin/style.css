@@ -93,12 +93,13 @@
 * { box-sizing: border-box; }
 html {
   -webkit-text-size-adjust: 100%;
-  /* BELT (second layer only — overflow is fixed at the source: .tip::after
-     display:none while hidden, .drawer edge-pinned): the viewport itself
-     never pans sideways. overflow-x on html propagates to the viewport, so
-     position:sticky (topbar, table heads) keeps working. clip is preferred
-     over hidden because clip never creates a scroll container; hidden is the
-     fallback where clip is unsupported. */
+  /* BELT (second layer only — overflow is fixed at the source: the tip
+     bubble is a body-level position:fixed singleton, display:none at rest;
+     .drawer edge-pinned): the viewport itself never pans sideways.
+     overflow-x on html propagates to the viewport, so position:sticky
+     (topbar, table heads) keeps working. clip is preferred over hidden
+     because clip never creates a scroll container; hidden is the fallback
+     where clip is unsupported. */
   overflow-x: hidden;
   overflow-x: clip;
   overscroll-behavior-x: none;
@@ -433,27 +434,26 @@ th.sortable:hover { color: var(--text); }
   font-family: var(--font); line-height: 1;
 }
 .tip:hover, .tip:focus-visible { color: var(--accent); border-color: var(--accent-border); }
-.tip::after {
-  content: attr(data-tip);
-  /* display:none while hidden — an opacity-0 bubble still occupies layout,
-     and a 260px box centered on a dot near the right edge extends the
-     document's scrollable overflow (the mobile horizontal-pan bug). The
-     max-width clamp keeps a SHOWN bubble within the viewport too. */
+/* The bubble: ONE shared element on <body>, position:fixed and JS-placed
+   from the trigger (core.js tip engine — the chart-tooltip pattern). A
+   ::after inside .table-wrap { overflow:auto } gets clipped by the scroll
+   container; a body-level fixed element escapes every clipping ancestor
+   WITHOUT loosening the overflow containment. Never a horizontal-overflow
+   source: display:none at rest, viewport-capped width (§9 clamp), and the
+   JS clamps its position on-screen. Theme-safe by construction (tokens). */
+.tip-bubble {
+  position: fixed;
   display: none;
-  position: absolute; left: 50%; bottom: calc(100% + 8px);
-  transform: translateX(-50%);
+  z-index: 160;
   width: max-content; max-width: min(260px, calc(100vw - 24px));
   background: var(--text); color: var(--bg);
   font-size: var(--fs-xs); font-weight: 500; line-height: 1.45;
   text-transform: none; letter-spacing: 0;
   padding: 8px 10px; border-radius: var(--r-sm);
   box-shadow: var(--shadow-lg);
-  opacity: 0; pointer-events: none; transition: opacity 0.12s;
-  z-index: 60;
+  pointer-events: none;
   text-align: left; white-space: normal;
 }
-.tip:hover::after, .tip:focus-visible::after { display: block; opacity: 1; }
-.tip.tip-left::after { left: auto; right: -6px; transform: none; }
 
 /* ---- Toasts ---- */
 #toasts {
