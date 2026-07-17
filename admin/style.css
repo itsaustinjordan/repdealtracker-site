@@ -91,7 +91,25 @@
 
 /* ---- Base ---- */
 * { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
+html {
+  -webkit-text-size-adjust: 100%;
+  /* BELT (second layer only — overflow is fixed at the source: .tip::after
+     display:none while hidden, .drawer edge-pinned): the viewport itself
+     never pans sideways. overflow-x on html propagates to the viewport, so
+     position:sticky (topbar, table heads) keeps working. clip is preferred
+     over hidden because clip never creates a scroll container; hidden is the
+     fallback where clip is unsupported. */
+  overflow-x: hidden;
+  overflow-x: clip;
+  overscroll-behavior-x: none;
+}
+body {
+  /* clip only (no hidden fallback): overflow-x:hidden on body would make it
+     a scroll container and break position:sticky descendants; clip is safe
+     and old browsers simply ignore it (html above still covers them). */
+  overflow-x: clip;
+  overscroll-behavior-x: none;
+}
 body {
   margin: 0;
   font-family: var(--font);
@@ -417,9 +435,14 @@ th.sortable:hover { color: var(--text); }
 .tip:hover, .tip:focus-visible { color: var(--accent); border-color: var(--accent-border); }
 .tip::after {
   content: attr(data-tip);
+  /* display:none while hidden — an opacity-0 bubble still occupies layout,
+     and a 260px box centered on a dot near the right edge extends the
+     document's scrollable overflow (the mobile horizontal-pan bug). The
+     max-width clamp keeps a SHOWN bubble within the viewport too. */
+  display: none;
   position: absolute; left: 50%; bottom: calc(100% + 8px);
   transform: translateX(-50%);
-  width: max-content; max-width: 260px;
+  width: max-content; max-width: min(260px, calc(100vw - 24px));
   background: var(--text); color: var(--bg);
   font-size: var(--fs-xs); font-weight: 500; line-height: 1.45;
   text-transform: none; letter-spacing: 0;
@@ -429,7 +452,7 @@ th.sortable:hover { color: var(--text); }
   z-index: 60;
   text-align: left; white-space: normal;
 }
-.tip:hover::after, .tip:focus-visible::after { opacity: 1; }
+.tip:hover::after, .tip:focus-visible::after { display: block; opacity: 1; }
 .tip.tip-left::after { left: auto; right: -6px; transform: none; }
 
 /* ---- Toasts ---- */
@@ -472,7 +495,9 @@ th.sortable:hover { color: var(--text); }
 .drawer {
   position: fixed; z-index: 101;
   top: 0; right: 0; bottom: 0;
-  width: min(760px, 100vw);
+  /* % (of the initial containing block), not vw: 100vw ignores a classic
+     scrollbar and can exceed the visible viewport */
+  width: min(760px, 100%);
   background: var(--surface);
   border-left: 1px solid var(--border);
   box-shadow: var(--shadow-lg);
@@ -490,7 +515,9 @@ th.sortable:hover { color: var(--text); }
   margin-bottom: var(--sp-4);
 }
 .drawer-sub { color: var(--text-3); font-size: var(--fs-xs); margin-top: 3px; }
-@media (max-width: 760px) { .drawer { width: 100vw; border-left: 0; } }
+/* full-bleed on small screens by pinning BOTH edges — exact viewport width
+   with no vw unit involved */
+@media (max-width: 760px) { .drawer { left: 0; width: auto; border-left: 0; } }
 
 /* search overlay */
 .search-modal {

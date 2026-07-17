@@ -664,7 +664,23 @@ async function ensureUsers() {
   return state.cache.users;
 }
 
+// At most one search overlay can ever exist: ⌘K (or the topbar button) while
+// it is open refocuses and selects the existing input instead of stacking a
+// second palette — native command-palette behavior. The isConnected check
+// covers a wrap removed by an outside path (e.g. the sign-out layer clear)
+// without close() running; its stale document keydown listener is detached
+// before a fresh overlay is built.
+let searchOverlay = null; // { wrap, input, close }
+
 function openSearch() {
+  if (searchOverlay) {
+    if (searchOverlay.wrap.isConnected) {
+      searchOverlay.input.focus();
+      searchOverlay.input.select();
+      return;
+    }
+    searchOverlay.close();
+  }
   const input = el('input', { type: 'text', placeholder: 'Search users and deals…', autocomplete: 'off', spellcheck: 'false' });
   const results = el('div', { class: 'search-results' },
     el('p', { class: 'search-empty', text: 'Type to search every user and every deal (owner or account #). Deals refresh every 5 minutes.' }));
@@ -672,7 +688,13 @@ function openSearch() {
     el('div', { class: 'search-input-row' }, el('span', { class: 'search-fake-icon', text: '⌕' }), input, el('kbd', { text: 'esc' })),
     results);
   const wrap = openLayer(modal, () => close());
-  const close = () => { wrap.remove(); document.removeEventListener('keydown', onKey); };
+  const close = () => {
+    wrap.remove();
+    document.removeEventListener('keydown', onKey);
+    // only clear the guard if it still points at THIS overlay — a stale
+    // close() run late must not unguard a newer one
+    if (searchOverlay && searchOverlay.close === close) searchOverlay = null;
+  };
 
   let hits = [];
   let sel = 0;
@@ -759,6 +781,7 @@ function openSearch() {
     else if (e.key === 'Enter' && hits[sel]) { close(); hits[sel].go(); }
   };
   document.addEventListener('keydown', onKey);
+  searchOverlay = { wrap, input, close };
   input.focus();
 }
 
