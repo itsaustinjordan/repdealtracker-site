@@ -1,0 +1,14 @@
+{
+  "name": "Deal Tracker Admin",
+  "short_name": "DT Admin",
+  "description": "Admin panel for the Deal Tracker app",
+  "start_url": "/admin/",
+  "scope": "/admin/",
+  "display": "standalone",
+  "background_color": "#f7f8fa",
+  "theme_color": "#1f6feb",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
