@@ -559,6 +559,7 @@ async function loadDrawer(dealId) {
       audit: (resp && resp.audit) || [],
       scan_event: (resp && resp.scan_event) || null,
       image_url: (resp && typeof resp.image_url === 'string') ? resp.image_url : null,
+      image_status: (resp && typeof resp.image_status === 'string') ? resp.image_status : null,
     };
   } catch (e) {
     if (e.handled) return;
@@ -577,6 +578,7 @@ async function refreshDrawerQuiet(dr) {
       audit: (resp && resp.audit) || dr.data.audit,
       scan_event: resp ? (resp.scan_event || null) : dr.data.scan_event,
       image_url: resp && typeof resp.image_url === 'string' ? resp.image_url : dr.data.image_url,
+      image_status: resp && typeof resp.image_status === 'string' ? resp.image_status : dr.data.image_status,
     };
     render();
   } catch (e) { /* quiet refresh — keep what we have */ }
@@ -1385,7 +1387,7 @@ function sectionActivity(d) {
 function sectionDeleted(d) {
   const s = d.deletedDeals;
   const root = el('div', {});
-  root.append(el('p', { class: 'muted small', style: 'margin-bottom:10px', text: 'Deals this rep deleted appear here and can be restored exactly as they were at deletion — same id, same commission source.' }));
+  root.append(el('p', { class: 'muted small', style: 'margin-bottom:10px', text: 'Deals this rep deleted appear here and can be restored exactly as they were at deletion — same id, same commission source. Deleted photos do not come back — restore recovers the record.' }));
   if (s.error) root.append(el('p', { class: 'msg msg-err', text: s.error }));
   if (s.rows === null) { root.append(skeletonRows(5, 20)); return root; }
   if (!s.rows.length) {
@@ -1407,7 +1409,7 @@ function sectionDeleted(d) {
           onclick: () => confirmModal({
             title: 'Restore this deal?',
             body: el('div', {},
-              el('p', { text: 'Restores the deal exactly as it was at deletion — same ID, same commission source, every field verbatim. The restore itself is recorded in the deal’s history.' }),
+              el('p', { text: 'Restores the deal exactly as it was at deletion — same ID, same commission source, every field verbatim. Deleted photos do not come back — restore recovers the record. The restore itself is recorded in the deal’s history.' }),
               el('p', { class: 'muted small', text: (r.owner_name || 'Unknown owner') + ' · ' + fmtISODate(r.deal_date) + ' · ' + money(r.volume) })),
             confirmLabel: 'Restore deal',
             onConfirm: async () => {
@@ -1415,7 +1417,9 @@ function sectionDeleted(d) {
                 const resp = await adminApi('restore_deal', { deal_id: r.row_id });
                 s.rows = s.rows.filter((x) => x.row_id !== r.row_id);
                 d.deals.rows = null; // deals list is stale now
-                toast('ok', 'Deal restored.');
+                toast('ok', resp && resp.image_missing
+                  ? 'Deal restored — the record is back, but its photo was removed at deletion and does not come back.'
+                  : 'Deal restored.');
                 nav('deal/' + ((resp && resp.deal && resp.deal.id) || r.row_id));
               } catch (e) {
                 const msgs = {
@@ -1485,40 +1489,69 @@ function drawerRead(dr) {
   const deal = dr.data.deal;
   const root = el('div', {});
 
-  // -- scanned image + replay --
+  // -- scanned image + replay (three states from get_deal's image_status:
+  //    ok → thumbnail; missing → the object is confirmed gone (deleted
+  //    in-app, row later restored) with a clear-pointer offer; anything
+  //    else → retryable signing hiccup) --
   if (dr.data.image_url || deal.source_image_ref) {
     const imgPanel = el('div', { class: 'deal-image-panel card', style: 'padding:14px' });
+    const imageMissing = dr.data.image_status === 'missing';
     if (dr.data.image_url) {
       const img = el('img', { class: 'deal-thumb', src: dr.data.image_url, alt: 'Scanned form', title: 'Click to view full size' });
       img.addEventListener('click', () => openLightbox(dr.data.image_url));
       imgPanel.append(img);
+    } else if (imageMissing) {
+      const clearBtn = el('button', { class: 'btn btn-small', style: 'margin-top:8px' }, 'Clear stale image pointer');
+      clearBtn.addEventListener('click', () => {
+        // Plain confirm (no typed word): nulling a pointer at a confirmed-
+        // gone object is low-stakes — but it routes through update_deal so
+        // it's logged like any deal edit.
+        confirmModal({
+          title: 'Clear the stale image pointer?',
+          confirmLabel: 'Clear pointer',
+          body: 'The photo itself is already gone — this only removes the dead reference from the deal record, so this panel and the app (“View Original”) stop advertising an image that doesn’t exist. The change is logged like any deal edit.',
+          onConfirm: async () => {
+            await adminApi('update_deal', { deal_id: dr.dealId, fields: { source_image_ref: null } });
+            toast('ok', 'Stale image pointer cleared.');
+            loadDrawer(dr.dealId); // refetch: no-image drawer + the fresh audit row
+            if (state.detail) loadDeals(true);
+          },
+        });
+      });
+      imgPanel.append(el('div', { style: 'max-width:240px' },
+        el('p', { class: 'muted small', text: 'The photo was removed when this deal was deleted — the restore recovered the record, not the image.' }),
+        clearBtn));
     } else {
-      imgPanel.append(el('p', { class: 'muted small', text: 'An image path is stored but the preview link could not be created.' }));
+      imgPanel.append(el('p', { class: 'muted small', text: 'Preview couldn’t be created — reopen to retry.' }));
     }
     const side = el('div', { class: 'grow' },
       el('h3', { text: 'Scanned form' }),
       el('p', { class: 'muted small', style: 'margin:4px 0 10px', text: 'The original photo this deal was extracted from. Click it to zoom.' }));
-    const replayBtn = el('button', { class: 'btn btn-small', disabled: dr.replayRunning }, dr.replayRunning ? 'Replaying…' : '⟳ Replay extraction');
-    replayBtn.addEventListener('click', () => {
-      confirmModal({
-        title: 'Replay the extraction?',
-        body: 'Runs the current production prompt on the stored image and shows the result next to what’s saved — useful for judging whether a re-scan would read better today. Costs roughly $0.01–0.03 in API spend. Nothing about the deal is changed.',
-        confirmLabel: 'Run replay',
-        onConfirm: async () => {
-          dr.replayRunning = true;
-          dr.replay = null;
-          render();
-          try {
-            dr.replay = await adminApi('replay_extraction', { deal_id: dr.dealId });
-          } catch (e) {
-            if (!e.handled) dr.replay = { error: e.message };
-          }
-          dr.replayRunning = false;
-          render();
-        },
+    // Replay downloads the stored object — with the object confirmed gone
+    // it cannot succeed, so the button hides in the missing state.
+    if (!imageMissing) {
+      const replayBtn = el('button', { class: 'btn btn-small', disabled: dr.replayRunning }, dr.replayRunning ? 'Replaying…' : '⟳ Replay extraction');
+      replayBtn.addEventListener('click', () => {
+        confirmModal({
+          title: 'Replay the extraction?',
+          body: 'Runs the current production prompt on the stored image and shows the result next to what’s saved — useful for judging whether a re-scan would read better today. Costs roughly $0.01–0.03 in API spend. Nothing about the deal is changed.',
+          confirmLabel: 'Run replay',
+          onConfirm: async () => {
+            dr.replayRunning = true;
+            dr.replay = null;
+            render();
+            try {
+              dr.replay = await adminApi('replay_extraction', { deal_id: dr.dealId });
+            } catch (e) {
+              if (!e.handled) dr.replay = { error: e.message };
+            }
+            dr.replayRunning = false;
+            render();
+          },
+        });
       });
-    });
-    side.append(replayBtn);
+      side.append(replayBtn);
+    }
     imgPanel.append(side);
     root.append(imgPanel);
   }
@@ -2118,7 +2151,11 @@ function toolsStorage() {
   const selected = s._selected || (s._selected = new Set());
   const oCard = el('div', { class: 'card' },
     el('div', { class: 'card-title' }, el('h2', { text: 'Orphaned images (' + intFmt(orphans.length) + ')' }),
-      tip('Files in the bucket that no live deal points at. They usually come from scans whose batch was never confirmed. A very recent orphan can be a scan in progress RIGHT NOW — leave anything newer than a day alone.')));
+      tip('Files that no live deal points at AND no restorable deleted deal claims. They usually come from scans whose batch was never confirmed. A very recent orphan can be a scan in progress RIGHT NOW — leave anything newer than a day alone.')));
+  if (typeof s.protected_restorable === 'number' && s.protected_restorable > 0) {
+    oCard.append(el('p', { class: 'muted small', style: 'margin-bottom:10px', text:
+      intFmt(s.protected_restorable) + ' more object(s) are protected and not listed: they belong to restorable deleted deals and stay until that deletion history is pruned.' }));
+  }
   if (!orphans.length) {
     oCard.append(emptyState('No orphans', 'Every stored image belongs to a live deal.'));
   } else {
@@ -2155,8 +2192,8 @@ function toolsStorage() {
         typed: 'DELETE',
         confirmLabel: 'Delete images',
         body: el('div', {},
-          el('p', { text: 'Permanently removes these files from storage. They belong to no deal, so no deal loses its image — but if one is a scan happening right now (uploaded within the last day, marked “recent”), that rep’s “View Original” will be broken for the deal they’re about to save.' }),
-          el('p', { text: 'The server re-checks every path at execution time and refuses any that a deal references. This cannot be undone.' })),
+          el('p', { text: 'Permanently removes these files from storage. They belong to no live deal, and images of restorable deleted deals are protected until their history is pruned — but if one is a scan happening right now (uploaded within the last day, marked “recent”), that rep’s “View Original” will be broken for the deal they’re about to save.' }),
+          el('p', { text: 'The server re-checks every path at execution time and refuses anything a live deal references or a restorable deletion still claims. This cannot be undone.' })),
         onConfirm: async () => {
           const resp = await adminApi('delete_orphans', { paths, confirm: 'DELETE' });
           toast('ok', 'Deleted ' + intFmt(resp.deleted) + ' file(s)' + ((resp.skipped || []).length ? ' · ' + resp.skipped.length + ' skipped (now referenced)' : '') + '.');
@@ -2222,7 +2259,7 @@ function toolsData() {
       el('div', { class: 'row' }, 'older than', months, 'months', btn));
   };
   pruneCard.append(mkPrune('scan_events', 'scan telemetry'));
-  pruneCard.append(mkPrune('audit_log', 'audit history', 'Restore snapshots older than the cutoff are destroyed with it — deleted deals from before the cutoff can never be restored again.'));
+  pruneCard.append(mkPrune('audit_log', 'audit history', 'Restore snapshots older than the cutoff are destroyed with it — deleted deals from before the cutoff can never be restored again, and the storage janitor’s image protection for those older deletions lapses with them (their photos become deletable orphans).'));
   root.append(pruneCard);
   return root;
 }
