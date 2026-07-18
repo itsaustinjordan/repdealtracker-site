@@ -1186,7 +1186,11 @@ function sectionOverview(d, row) {
       },
     });
   });
-  const emailAction = (label, action, okText) => {
+  // Success text = WORKFLOW instructions: the emailed 6-digit code's only
+  // home is the app's cold-entry path (sign-in → "Have a code from
+  // support?"), and any newer send replaces it — the admin needs to know
+  // both to walk a rep through it.
+  const emailAction = (label, action, okText, tipText) => {
     const btn = el('button', { class: 'btn' }, label);
     btn.addEventListener('click', async () => {
       btn.disabled = true;
@@ -1199,12 +1203,16 @@ function sectionOverview(d, row) {
       }
       btn.disabled = false;
     });
-    return btn;
+    return el('span', { class: 'row', style: 'gap:6px;flex-wrap:nowrap' }, btn, tip(tipText));
   };
   actCard.append(el('div', { class: 'btn-row' },
     banBtn,
-    emailAction('Resend confirmation', 'resend_confirmation', 'Confirmation email sent.'),
-    emailAction('Send password reset', 'send_password_reset', 'Password reset email sent.')), actMsg);
+    emailAction('Resend confirmation', 'resend_confirmation',
+      'Code sent. Tell the rep: sign-in screen → “Have a code from support?” → enter their email + the 6-digit code, choose “New account”. Codes are single-use, expire, and are replaced by any newer send (including the rep tapping resend).',
+      'Emails a fresh 6-digit account-confirmation code. The rep enters it in the app: sign-in → “Have a code from support?” → “New account”. Any newer send replaces it.'),
+    emailAction('Send password reset', 'send_password_reset',
+      'Code sent. Tell the rep: sign-in screen → “Have a code from support?” → enter their email + the 6-digit code, choose “Password reset”. Codes are single-use, expire, and are replaced by any newer send (including the rep tapping resend).',
+      'Emails a fresh 6-digit password-reset code. The rep enters it in the app: sign-in → “Have a code from support?” → “Password reset”. Any newer send replaces it.')), actMsg);
   root.append(actCard);
 
   // -- delete user (typed email confirm — unchanged server contract) --
