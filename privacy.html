@@ -21,79 +21,117 @@
   a { color: #1f6feb; }
   ul { padding-left: 20px; }
   .foot { margin-top: 48px; font-size: 13px; color: #888; border-top: 1px solid #eee; padding-top: 16px; }
+  .nav { margin-top: 12px; }
+  .nav a { color: #888; }
 </style>
 </head>
 <body>
   <h1>Privacy Policy</h1>
-  <p class="updated">Deal Tracker &middot; Last updated July 10, 2026</p>
+  <p class="updated">Deal Tracker &middot; Last updated September 7, 2026</p>
 
-  <p>Deal Tracker (&ldquo;the app,&rdquo; &ldquo;we&rdquo;) is an independent tool
-     for sales representatives to scan, log, and track their deals and commissions.
-     This policy explains what the app collects and how it is handled. Deal Tracker
-     is not affiliated with or endorsed by any resort company.</p>
+  <p>Deal Tracker (&ldquo;the app,&rdquo; &ldquo;we,&rdquo; &ldquo;us&rdquo;) is an
+     independent iOS app for timeshare sales representatives to scan, log, and track
+     their own deals and commissions. This policy explains what the app stores, who
+     processes it, and how you can control it.</p>
+  <p>Deal Tracker is not affiliated with, endorsed by, or connected to Westgate
+     Resorts or any other resort company or employer. Reps use it for their own
+     records.</p>
 
   <h2>1. Who uses this app</h2>
-  <p>Deal Tracker is used by sales representatives (&ldquo;you&rdquo;). In using it,
-     you input information about your customers and deals by photographing sales
-     proposal forms. You are responsible for handling your customers&rsquo;
-     information in accordance with your employer&rsquo;s policies and applicable law.</p>
+  <p>Deal Tracker is used by sales representatives (&ldquo;you&rdquo;). When you
+     photograph or enter a sales form, you are entering information about your
+     customers. We store that information on your behalf. You are responsible for
+     handling your customers&rsquo; information in line with your own legal and
+     employer obligations.</p>
 
-  <h2>2. Information we collect</h2>
+  <h2>2. Information we store</h2>
   <ul>
-    <li><strong>Account information:</strong> your email address and password, used
-        to sign you in.</li>
-    <li><strong>Deal and customer information:</strong> when you photograph a proposal
-        form, the app stores the form image and extracts data from it, which may
-        include customer names, phone numbers, purchase and financing terms, market
-        source, and commission details.</li>
+    <li><strong>Account information:</strong> the email address you use to sign
+        in.</li>
+    <li><strong>Deal records:</strong> the details you scan or enter for each deal.
+        These include your customers&rsquo; personal information, such as names,
+        phone numbers, account numbers, and purchase, financing, and commission
+        figures.</li>
+    <li><strong>Scanned form images:</strong> the photos you take of sales forms.
+        They are kept in private storage and can only be opened through short-lived
+        signed links from your signed-in account.</li>
+    <li><strong>Usage telemetry:</strong> basic events such as when a scan is
+        started or finished, used to keep the app working and to understand how it
+        is used. Telemetry never includes form contents or customer details.</li>
   </ul>
-  <p>We do <strong>not</strong> collect analytics, advertising identifiers, location
-     data, or your device contacts.</p>
+  <p>We do not collect advertising identifiers, location data, or your device
+     contacts.</p>
 
   <h2>3. How we use information</h2>
-  <p>Solely to provide the app&rsquo;s functionality: reading deal data from your
-     photos, and showing you your deals, commissions, and related metrics. Each
+  <p>We use your information only to provide the app: reading deal data from your
+     photos and showing you your deals, commissions, and related totals. Each
      account can access only its own data.</p>
+  <p>We never sell your data or your customers&rsquo; data, never use it for
+     advertising, and never use it to train AI models.</p>
 
-  <h2>4. Third-party services</h2>
-  <p>The app relies on the following service providers to function:</p>
+  <h2>4. Where data is stored</h2>
+  <p>Your data is stored with Supabase on servers located in the United States. If
+     you use the app from outside the United States, your data is transferred to
+     and stored there.</p>
+
+  <h2>5. Service providers</h2>
+  <p>The app relies on these providers to work. Each receives only what it needs
+     for its role.</p>
   <ul>
-    <li><strong>Supabase</strong> &mdash; hosts the database, authentication, and
+    <li><strong>Supabase</strong> &mdash; hosts the database, sign-in, and private
         image storage.</li>
-    <li><strong>Anthropic (Claude API)</strong> &mdash; form images are sent to
-        Anthropic&rsquo;s API to automatically read and extract the printed fields
-        from the form.</li>
+    <li><strong>Anthropic (Claude API)</strong> &mdash; when you scan a form, the
+        image is sent to Anthropic&rsquo;s API to read the printed fields and turn
+        them into a deal record. Anthropic processes the image to provide this
+        service to us.</li>
+    <li><strong>Apple</strong> &mdash; handles all payments and subscriptions
+        through the App Store. Your card details stay with Apple and never reach
+        us.</li>
+    <li><strong>RevenueCat</strong> &mdash; processes your subscription status so
+        the app knows whether your subscription is active. RevenueCat does not
+        receive card numbers either.</li>
   </ul>
-  <p>We do not sell your data or your customers&rsquo; data, and we do not use it for
-     advertising.</p>
 
-  <h2>5. Data retention and deletion</h2>
-  <p>Your data is retained while your account is active. You can delete individual
-     deals in the app, which removes the stored record and its associated image. To
-     delete your account and all associated data, email
+  <h2>6. Your customers&rsquo; data</h2>
+  <p>The customer information in your deal records belongs to your customers and is
+     entered by you. We store it on your behalf so you can keep your own records.
+     You are responsible for making sure you may record it and for handling it
+     consistently with your legal and employer obligations. We never sell it, use
+     it for advertising, or train AI models on it.</p>
+
+  <h2>7. Retention and deletion</h2>
+  <p>Your data is kept while your account is active. You can delete individual
+     deals in the app, which removes the record and its image.</p>
+  <p>To delete your account and everything in it, open <strong>Settings &rarr;
+     Delete account</strong> in the app. Deletion is immediate and permanent: your
+     account, deal records, and scanned images are removed.</p>
+  <p>To request an export of your data, or for any other data question, email
      <a href="mailto:help@repdealtracker.app">help@repdealtracker.app</a>.</p>
 
-  <h2>6. Security</h2>
-  <p>Data is transmitted over encrypted connections and stored with access controls
-     so that each account can access only its own records. No method of transmission
-     or storage is completely secure, but we take reasonable measures to protect your
+  <h2>8. Security</h2>
+  <p>Data travels over encrypted connections. Records are protected by access
+     controls so each account can only reach its own data, and form images live in
+     private storage that is only reachable through signed links. No system is
+     completely secure, but we take reasonable measures to protect your
      information.</p>
 
-  <h2>7. Children</h2>
-  <p>The app is intended for professional use by adults and is not directed to
-     children under 13.</p>
+  <h2>9. Children</h2>
+  <p>The app is for professional use by adults and is not directed to children
+     under 13.</p>
 
-  <h2>8. Changes to this policy</h2>
-  <p>We may update this policy from time to time. The &ldquo;last updated&rdquo; date
-     above reflects the most recent revision.</p>
+  <h2>10. Changes to this policy</h2>
+  <p>We may update this policy from time to time. The &ldquo;last updated&rdquo;
+     date above shows the most recent revision.</p>
 
-  <h2>9. Contact</h2>
+  <h2>11. Contact</h2>
   <p>Questions about this policy? Email
      <a href="mailto:help@repdealtracker.app">help@repdealtracker.app</a>.</p>
 
   <p class="foot">
-    Deal Tracker is an independent app and is not affiliated with or endorsed by
-    any resort company.
+    Deal Tracker is an independent app and is not affiliated with, endorsed by, or
+    connected to Westgate Resorts or any other resort company or employer.
+    <span class="nav"><br><a href="/privacy">Privacy</a> &middot;
+    <a href="/terms">Terms</a> &middot; <a href="/support">Support</a></span>
   </p>
 </body>
 </html>
