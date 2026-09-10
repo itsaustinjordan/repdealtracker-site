@@ -2310,6 +2310,7 @@ const IMPORT_KIND_LABELS = {
   tradeEquity: 'Trade equity', tombstoneDealType: 'Tombstone deal type',
   tombstoneCancelReason: 'Tombstone cancel reason', cookie: 'Dashboard session cookie',
   scrapeIncomplete: 'Scrape incomplete', splitShellReview: 'Split shell review', unparsedRow: 'Unparsed listing row',
+  cancelledButPaid: 'Cancelled but paid',
 };
 
 // What to do next, per failure code the runner records (tool/import-rep.js
@@ -3089,6 +3090,7 @@ const IMPORT_RO_CLASSES = [
   ['split_shell', 'Split shells', 'Split siblings of kept deals that did not fold automatically; the operator decision on each is in its reason.'],
   ['could_not_scrape', 'Could not scrape', 'Listed under could-not-scrape: enter by hand.'],
   ['operator_skipped', 'Skipped by operator', 'Skipped by a decision this run (blocking or mismatch).'],
+  ['not_targeted', 'Not targeted this run', 'Eligible listing rows outside this targeted run\u2019s account list. Import them with a full or targeted job.'],
   ['unclassified', 'Unclassified', 'Eligible listing rows that produced no record. Investigate.'],
   ['unknown', 'Unclassified (no context)', 'The merge ran without a classification context.'],
 ];
@@ -3118,6 +3120,9 @@ function importShellSections(cm) {
   wrap.append(importExpandable('Split shells declared own deals (enter manually)', (cm.own_deal_shells || []).length, () =>
     importObjTable(cm.own_deal_shells, [{ key: 'account', label: 'Shell' }, { key: 'kept_account', label: 'Sibling of' }, { key: 'amount', label: 'Paid', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }]),
     { plain: 'Shells you declared their own deals. They are not imported; enter each in the app by hand with the paid figure.' }));
+  wrap.append(importExpandable('Kept earned by operator (cancelled but paid, gap not computable)', (cm.kept_earned || []).length, () =>
+    importObjTable(cm.kept_earned, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Status' }, { key: 'paid_amount', label: 'Paid', cls: 'num' }, { key: 'paid_rate', label: 'Rate', cls: 'num' }, { key: 'source', label: 'Why asked' }, { key: 'by', label: 'Decided by' }]),
+    { plain: 'Records that classified cancel-family while the report shows them paid and the bad-trade gap rule never ran (PDF-absent recovery, or no cancel date). You answered keep earned: imported as earned at the paid figures, with import_metadata.operator_keep_earned.', badge: (cm.kept_earned || []).length ? severityBadge('warn') : null }));
   wrap.append(importExpandable('Rate from report (unpaid, verify with accounting)', (cm.rate_from_report || []).length, () =>
     importObjTable(cm.rate_from_report, [{ key: 'account', label: 'Account' }, { key: 'rate', label: 'Report rate', cls: 'num' }, { key: 'amount_before', label: 'Computed', cls: 'num' }, { key: 'amount_after', label: 'At report rate', cls: 'num' }, { key: 'bucket', label: 'Bucket' }]),
     { plain: 'Live earned deals the report shows NOT PAID but with a rate line. The rate is applied (source manual, so the app never recomputes it); the unpaid amount is not taken. Verify each with accounting.', badge: (cm.rate_from_report || []).length ? severityBadge('warn') : null }));
@@ -3131,6 +3136,7 @@ const IMPORT_RECON_BUCKETS = [
   ['already_on_account', 'Already on the account', 'Dedupe: the account had the deal before this run.'],
   ['operator_skipped', 'Skipped by operator', 'Skipped by a blocking or mismatch decision this run.'],
   ['could_not_scrape', 'Could not scrape', 'No match on the dashboard, or a scrape error you chose to proceed past.'],
+  ['not_targeted', 'Not targeted', 'A targeted run: eligible rows outside the account list. Import them with a full or targeted job.'],
   ['unparsed', 'Unparsed', 'Lines that start with an account number but did not parse; each was skipped by decision.'],
   ['unaccounted', 'Unaccounted', 'Eligible rows that produced no record and fit no bucket. Must be zero.'],
 ];
