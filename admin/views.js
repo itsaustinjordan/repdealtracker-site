@@ -2309,7 +2309,7 @@ const IMPORT_KIND_LABELS = {
   dashboardDealType: 'Deal type (dashboard)', dashboardPenderStatus: 'Pender status (dashboard)',
   tradeEquity: 'Trade equity', tombstoneDealType: 'Tombstone deal type',
   tombstoneCancelReason: 'Tombstone cancel reason', cookie: 'Dashboard session cookie',
-  scrapeIncomplete: 'Scrape incomplete',
+  scrapeIncomplete: 'Scrape incomplete', splitShellReview: 'Split shell review', unparsedRow: 'Unparsed listing row',
 };
 
 // What to do next, per failure code the runner records (tool/import-rep.js
@@ -2339,7 +2339,14 @@ const IMP = {
 };
 
 function importFreshCreate() {
-  return { targetId: '', history: null, commission: null, uploads: null, busy: false, err: '', errJobId: null };
+  return { targetId: '', history: null, commission: null, accounts: '', note: '', uploads: null, busy: false, err: '', errJobId: null };
+}
+
+// Targeted accounts: 6 to 14 digits each, separated by commas, spaces or newlines (admin-api validates the same shape).
+function importParseAccounts(text) {
+  const toks = String(text || '').split(/[\s,;]+/).map((t) => t.trim()).filter(Boolean);
+  const bad = toks.filter((t) => !/^\d{6,14}$/.test(t));
+  return { accounts: Array.from(new Set(toks.filter((t) => /^\d{6,14}$/.test(t)))), bad };
 }
 
 function importStatusBadge(status) {
@@ -2548,6 +2555,8 @@ async function importCreateJob() {
     rerender('tools');
     return;
   }
+  const targeted = importParseAccounts(c.accounts);
+  if (targeted.bad.length) { c.err = 'Targeted accounts must be 6 to 14 digits each. Not accepted: ' + targeted.bad.slice(0, 5).join(', ') + (targeted.bad.length > 5 ? '…' : ''); rerender('tools'); return; }
   c.busy = true;
   c.uploads = {
     history: { pct: 0, status: 'Waiting', el: null },
@@ -2557,10 +2566,12 @@ async function importCreateJob() {
   try {
     const historyPath = await importUploadOne('history', c.history);
     const commissionPath = c.commission ? await importUploadOne('commission', c.commission) : null;
+    const params = targeted.accounts.length ? { accounts: targeted.accounts } : {};
     const resp = await adminApi('create_import_job', {
       target_user_id: c.targetId,
       pdf_history_path: historyPath,
       pdf_commission_path: commissionPath,
+      params,
     });
     const job = resp && resp.job;
     toast('ok', 'Import queued for ' + (target.email || target.user_id) + '. The runner picks it up within about 20 seconds.');
@@ -2626,6 +2637,10 @@ function importCreateCard() {
     sel,
     IMP.usersErr ? el('span', { class: 'msg msg-err', text: 'Could not load the roster: ' + IMP.usersErr }) : null));
 
+  if (c.note) {
+    card.append(el('div', { class: 'callout callout-info', style: 'margin-bottom:12px' }, el('div', { class: 'callout-body' }, el('strong', { text: 'Targeted follow-up job' }), c.note)));
+  }
+
   // -- file pickers --
   const picker = (kind, label, tipText, required) => {
     const file = c[kind];
@@ -2656,6 +2671,14 @@ function importCreateCard() {
     'The Westgate dashboard’s deal-history export for this rep. Every account number in it is a candidate; the runner scrapes each one that is not already on the account.', true));
   card.append(picker('commission', 'Commission report PDF',
     'The rep’s paid-commission report. Optional: without it every commission is computed from the rate rules; with it, paid amounts override the computed ones and the report gains the commission cross-checks.', false));
+
+  // -- targeted accounts (optional) --
+  const acctIn = el('textarea', { rows: '2', style: 'width:100%', class: 'edit-area', placeholder: 'Account numbers, separated by commas or new lines (optional)', disabled: c.busy });
+  acctIn.value = c.accounts || '';
+  acctIn.addEventListener('input', () => { c.accounts = acctIn.value; c.err = ''; });
+  card.append(el('div', { class: 'field', style: 'margin:10px 0 12px' },
+    el('span', {}, el('span', { class: 'strong', text: 'Targeted accounts (optional) ' }), tip('Leave empty for a normal import of everything in the all-deals PDF. List account numbers to import ONLY those: the case for deals the commission report paid but the all-deals report does not list (the review and results screens name them under "absent from the all-deals report"). The PDF stays required; a listed account with no PDF row is recovered from the dashboard alone, and its inferences are shown for review.')),
+    acctIn));
 
   // -- submit + inline errors --
   const go = el('button', { class: 'btn btn-primary', disabled: c.busy || !c.history || !c.targetId }, c.busy ? 'Uploading…' : '⬆ Upload and queue import');
@@ -3059,6 +3082,100 @@ function importObjTable(rows, cols) {
     rows.map((r) => ({ cells: cols.map((c) => fmt(c, r[c.key])) })));
 }
 
+const IMPORT_RO_CLASSES = [
+  ['already_on_account', 'Already on the account', 'In the app already, so the import left them alone; their commissions are untouched here. The reconcile tool stamps paid truth on existing deals.'],
+  ['absent_from_listing', 'Absent from the all-deals report', 'Paid on the commission report but not in the all-deals PDF. Import them with a targeted follow-up job.'],
+  ['excluded_by_gate', 'Excluded by the include gate', 'Listing rows the include gate rejects: non-sale, $0 gross, type E, or an unknown origin code. Never imported.'],
+  ['split_shell', 'Split shells', 'Split siblings of kept deals that did not fold automatically; the operator decision on each is in its reason.'],
+  ['could_not_scrape', 'Could not scrape', 'Listed under could-not-scrape: enter by hand.'],
+  ['operator_skipped', 'Skipped by operator', 'Skipped by a decision this run (blocking or mismatch).'],
+  ['unclassified', 'Unclassified', 'Eligible listing rows that produced no record. Investigate.'],
+  ['unknown', 'Unclassified (no context)', 'The merge ran without a classification context.'],
+];
+const IMPORT_RO_COLS = [{ key: 'account', label: 'Account' }, { key: 'status', label: 'Report bucket' }, { key: 'amount', label: 'Amount', cls: 'num' }, { key: 'reason', label: 'Why' }];
+
+// Report-only groups grouped by class, one expandable per class with its explanation.
+function importReportOnlyByClass(cm) {
+  const wrap = el('div', {});
+  const rows = Array.isArray(cm.report_only) ? cm.report_only : [];
+  for (const [cls, label, why] of IMPORT_RO_CLASSES) {
+    const mine = rows.filter((x) => (x.class || 'unknown') === cls);
+    if (!mine.length && cls !== 'absent_from_listing' && cls !== 'already_on_account') continue;
+    wrap.append(importExpandable('Report-only: ' + label.toLowerCase(), mine.length, () => importObjTable(mine, IMPORT_RO_COLS), { plain: why }));
+  }
+  return wrap;
+}
+
+function importShellSections(cm) {
+  const wrap = el('div', {});
+  wrap.append(importExpandable('Folded split shells', (cm.folded || []).length, () =>
+    importObjTable((cm.folded || []).map((f) => ({ kept_account: f.kept_account, shells: f.shells.map((s) => s.account + ' ' + money(s.amount)).join(', '), kept_paid: f.kept_paid, sum: f.sum, rate: f.rate, volume: f.volume })),
+      [{ key: 'kept_account', label: 'Kept deal' }, { key: 'shells', label: 'Shells folded' }, { key: 'kept_paid', label: 'Kept paid', cls: 'num' }, { key: 'sum', label: 'New commission', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'volume', label: 'Volume', cls: 'num' }]),
+    { plain: 'Paperwork rows whose paid line completes the kept deal: kept + shell equals rate times volume within one dollar, so the amount folds into the kept deal (import_metadata.split_shell_folded).' }));
+  wrap.append(importExpandable('Split shells folded by operator (flagged)', (cm.flagged_shells || []).length, () =>
+    importObjTable(cm.flagged_shells, [{ key: 'kept_account', label: 'Kept deal' }, { key: 'account', label: 'Shell' }, { key: 'amount', label: 'Amount added', cls: 'num' }, { key: 'implied_rate', label: 'Implied rate', cls: 'num' }]),
+    { plain: 'Amounts that did not reconcile but were folded on your decision. Each kept deal carries import_metadata.split_shell_flag.', badge: (cm.flagged_shells || []).length ? severityBadge('warn') : null }));
+  wrap.append(importExpandable('Split shells declared own deals (enter manually)', (cm.own_deal_shells || []).length, () =>
+    importObjTable(cm.own_deal_shells, [{ key: 'account', label: 'Shell' }, { key: 'kept_account', label: 'Sibling of' }, { key: 'amount', label: 'Paid', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }]),
+    { plain: 'Shells you declared their own deals. They are not imported; enter each in the app by hand with the paid figure.' }));
+  wrap.append(importExpandable('Rate from report (unpaid, verify with accounting)', (cm.rate_from_report || []).length, () =>
+    importObjTable(cm.rate_from_report, [{ key: 'account', label: 'Account' }, { key: 'rate', label: 'Report rate', cls: 'num' }, { key: 'amount_before', label: 'Computed', cls: 'num' }, { key: 'amount_after', label: 'At report rate', cls: 'num' }, { key: 'bucket', label: 'Bucket' }]),
+    { plain: 'Live earned deals the report shows NOT PAID but with a rate line. The rate is applied (source manual, so the app never recomputes it); the unpaid amount is not taken. Verify each with accounting.', badge: (cm.rate_from_report || []).length ? severityBadge('warn') : null }));
+  return wrap;
+}
+
+const IMPORT_RECON_BUCKETS = [
+  ['imported', 'Imported', 'Listing rows that became candidate records (tombstones included).'],
+  ['excluded_by_gate', 'Include gate', 'Rejected by the include gate: non-sale, $0 gross, negative gross, or type E.'],
+  ['excluded_D', 'Unknown origin', 'Origin code outside N/U/E (D or a new letter). Money-bearing ones were asked about.'],
+  ['already_on_account', 'Already on the account', 'Dedupe: the account had the deal before this run.'],
+  ['operator_skipped', 'Skipped by operator', 'Skipped by a blocking or mismatch decision this run.'],
+  ['could_not_scrape', 'Could not scrape', 'No match on the dashboard, or a scrape error you chose to proceed past.'],
+  ['unparsed', 'Unparsed', 'Lines that start with an account number but did not parse; each was skipped by decision.'],
+  ['unaccounted', 'Unaccounted', 'Eligible rows that produced no record and fit no bucket. Must be zero.'],
+];
+
+function importReconciliation(lr) {
+  if (!lr) return el('p', { class: 'muted small', text: 'No listing reconciliation in this report (older runner).' });
+  const wrap = el('div', {});
+  wrap.append(el('h3', { style: 'margin-bottom:8px' }, 'Listing reconciliation ', tip('Every row of the all-deals PDF lands in exactly one bucket, and the bucket counts must add up to the parsed row count. Every commission report group is matched or classified. Unaccounted must be zero.')));
+  if (!lr.complete || !lr.tie_out) {
+    wrap.append(el('div', { class: 'callout callout-danger' }, el('div', { class: 'callout-body' },
+      el('strong', { text: !lr.tie_out ? 'Tie-out failed' : 'Unaccounted rows: ' + intFmt(lr.unaccounted.length) }),
+      !lr.tie_out ? 'The bucket counts do not add up to the parsed row count.' : 'Eligible listing rows that produced no record: ' + lr.unaccounted.join(', '))));
+  } else {
+    wrap.append(el('p', { class: 'msg msg-ok', style: 'margin:0 0 8px', text: 'Tie-out PASS: ' + intFmt(lr.total_rows) + ' listing rows, every one accounted for.' }));
+  }
+  wrap.append(buildTable(
+    [{ label: 'Bucket' }, { label: 'Rows', cls: 'num' }, { label: 'What it means' }],
+    IMPORT_RECON_BUCKETS.map(([k, label, why]) => ({ cells: [el('span', {}, label, ' ', tip(why)), intFmt(lr.counts[k] || 0), el('span', { class: 'muted small', text: why })] })), { noCollapse: true }));
+  if (lr.imported_pdf_absent && lr.imported_pdf_absent.length) wrap.append(el('p', { class: 'muted small', style: 'margin-top:6px', text: 'Plus ' + intFmt(lr.imported_pdf_absent.length) + ' targeted PDF-absent import(s), not listing rows: ' + lr.imported_pdf_absent.join(', ') }));
+  const b = lr.buckets || {};
+  const lists = el('div', { style: 'margin-top:8px' });
+  lists.append(importExpandable('Include gate rows', (b.excluded_by_gate || []).length, () => importObjTable(b.excluded_by_gate, [{ key: 'account', label: 'Account' }, { key: 'flags', label: 'Flags' }])));
+  lists.append(importExpandable('Unknown origin rows', (b.excluded_D || []).length, () => importObjTable(b.excluded_D, [{ key: 'account', label: 'Account' }, { key: 'origin', label: 'Origin' }, { key: 'money_bearing', label: 'Money bearing' }])));
+  lists.append(importExpandable('Already on the account', (b.already_on_account || []).length, () => importObjTable(b.already_on_account, [{ key: 'account', label: 'Account' }])));
+  lists.append(importExpandable('Skipped by operator', (b.operator_skipped || []).length, () => importObjTable(b.operator_skipped, [{ key: 'account', label: 'Account' }, { key: 'decision', label: 'Decision' }])));
+  lists.append(importExpandable('Could not scrape', (b.could_not_scrape || []).length, () => importObjTable(b.could_not_scrape, [{ key: 'account', label: 'Account' }, { key: 'reason', label: 'Why' }])));
+  lists.append(importExpandable('Unparsed lines', (b.unparsed || []).length, () => importObjTable(b.unparsed, [{ key: 'line', label: 'Line', cls: 'num' }, { key: 'decision', label: 'Decision' }])));
+  wrap.append(lists);
+  if (lr.report_groups) wrap.append(el('p', { class: lr.report_groups.tie_out ? 'muted small' : 'msg msg-err', style: 'margin-top:8px', text: 'Commission report groups: ' + intFmt(lr.report_groups.total) + ' = matched ' + intFmt(lr.report_groups.matched) + ' + report-only ' + intFmt(lr.report_groups.report_only) + (lr.report_groups.tie_out ? ' (tie-out PASS)' : ' (tie-out FAIL)') }));
+  return wrap;
+}
+
+// The done screen's "create a targeted follow-up job" affordance for absent-from-listing accounts.
+function importTargetedFollowUp(job, email, accounts) {
+  const btn = el('button', { class: 'btn btn-small btn-primary' }, '＋ Create targeted follow-up job (' + intFmt(accounts.length) + ')');
+  btn.addEventListener('click', () => {
+    IMP.create = importFreshCreate();
+    IMP.create.targetId = job.target_user_id;
+    IMP.create.accounts = accounts.join(', ');
+    IMP.create.note = 'Prefilled for ' + email + ' with ' + intFmt(accounts.length) + ' account(s) the commission report paid but the all-deals report does not list. Both PDFs must be uploaded again: the runner purges a finished job’s files.';
+    nav('tools/import');
+  });
+  return el('div', { class: 'btn-row' }, btn, el('span', { class: 'muted small', text: 'Prefills the target and the accounts; you re-upload both PDFs.' }));
+}
+
 function importKV(label, value) {
   return el('div', { class: 'agg-item' }, el('dt', { text: label }), el('dd', {}, value == null ? '—' : value));
 }
@@ -3148,10 +3265,11 @@ function importRenderReport(r) {
       { key: 'computed_amount', label: 'Computed', cls: 'num' }, { key: 'imported_amount', label: 'Paid', cls: 'num' }, { key: 'flags', label: 'Flags' }];
     cmWrap.append(importExpandable('Paid overrides (IMPORT bucket)', (imp.rows || []).length, () => importObjTable(imp.rows, impCols),
       { plain: 'Deals whose commission the report’s paid figure replaces. Flags mark a rate or amount that disagrees with the computed one.' }));
-    cmWrap.append(importExpandable('Unmatched commission rows (report only)', (cm.report_only || []).length, () =>
-      importObjTable(cm.report_only, [{ key: 'account', label: 'Account' }, { key: 'bucket', label: 'Bucket' }, { key: 'status', label: 'Status' }, { key: 'amount', label: 'Amount', cls: 'num' },
-        { key: 'split_shell', label: 'Split-shell suggestion', fmt: (s) => s ? 'shell of ' + s.of_account + ': owner ' + money(s.owner_commission) + ' + this = ' + money(s.suggested_fold_in) : '—' }]),
-      { plain: 'Paid lines with no candidate deal behind them. A split-shell suggestion means the account is a $0 sibling of another deal and its amount probably folds into that owner.' }));
+    cmWrap.append(importShellSections(cm));
+    cmWrap.append(importExpandable('Missing from the commission report', (cm.missing_from_report_accounts || []).length, () => el('p', { class: 'mono-sm', text: (cm.missing_from_report_accounts || []).join(', ') }),
+      { plain: 'Candidate deals with no lines on the commission report: usually very recent, or paid under another account number. They keep their computed figures.' }));
+    cmWrap.append(el('p', { class: 'muted small', style: 'margin:10px 0 4px', text: 'Report-only groups, classified (' + intFmt((cm.report_only || []).length) + '):' }));
+    cmWrap.append(importReportOnlyByClass(cm));
     cmWrap.append(importExpandable('Chargeback review', (cm.chargeback_review || []).length, () =>
       importObjTable(cm.chargeback_review, [{ key: 'account', label: 'Account' }, { key: 'suggested_amount', label: 'Suggested', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' },
         { key: 'cancelled', label: 'Cancelled' }, { key: 'cancel_reason', label: 'Reason' }, { key: 'lines', label: 'Lines', fmt: (l) => Array.isArray(l) ? intFmt(l.length) + ' line(s)' : '—' }]),
@@ -3174,6 +3292,9 @@ function importRenderReport(r) {
     }
   }
   root.append(cmWrap);
+
+  // 3b. listing reconciliation (airtight B1)
+  root.append(importReconciliation(r.listing_reconciliation));
 
   // 4. everything else the runner noticed
   const misc = el('div', {});
@@ -3260,6 +3381,8 @@ function importResultsCard(job, report, email, reportUrl, reportStatus, purgedAt
   const manual = Array.isArray(rec.manual_entry) ? rec.manual_entry.map(String) : [];
   const byAcct = new Map((report.could_not_scrape || []).map((x) => [String(x.account), x]));
   const manualRows = manual.map((a) => Object.assign({ account: a }, byAcct.get(a) || {}));
+  // Split shells the operator declared own deals join the checklist with their paid figure.
+  for (const s of (rec.own_deal_shells || [])) manualRows.push({ account: String(s.account), report_bucket: 'IMPORT', report_amount: s.amount, reason: 'split shell of ' + s.kept_account + ': own deal (paid ' + money(s.amount) + (s.rate != null ? ' at ' + s.rate + '%' : '') + ')' });
   card.append(importExpandable('Missing deals: enter these by hand', manualRows.length, () => {
     const wrap = el('div', {});
     wrap.append(buildTable(
@@ -3276,10 +3399,16 @@ function importResultsCard(job, report, email, reportUrl, reportStatus, purgedAt
   // unmatched commission rows + review flags
   const cm = report.commission;
   if (cm) {
-    card.append(importExpandable('Unmatched commission rows', (cm.report_only || []).length, () =>
-      importObjTable(cm.report_only, [{ key: 'account', label: 'Account' }, { key: 'bucket', label: 'Bucket' }, { key: 'status', label: 'Status' }, { key: 'amount', label: 'Amount', cls: 'num' },
-        { key: 'split_shell', label: 'Split-shell suggestion', fmt: (s) => s ? 'shell of ' + s.of_account + ': owner ' + money(s.owner_commission) + ' + this = ' + money(s.suggested_fold_in) : '—' }]),
-      { plain: 'Paid lines on the commission report with no imported deal behind them.' }));
+    const absent = (cm.report_only || []).filter((x) => x.class === 'absent_from_listing').map((x) => String(x.account));
+    if (absent.length) {
+      card.append(el('div', { class: 'callout callout-info' }, el('div', { class: 'callout-body' },
+        el('strong', { text: intFmt(absent.length) + ' paid deal(s) are not in the all-deals report' }),
+        'The commission report paid these accounts, but the all-deals PDF does not list them, so this run could not import them: ' + absent.join(', ') + '.',
+        importTargetedFollowUp(job, email, absent))));
+    }
+    card.append(importShellSections(cm));
+    card.append(el('p', { class: 'muted small', style: 'margin:10px 0 4px', text: 'Report-only groups, classified (' + intFmt((cm.report_only || []).length) + '):' }));
+    card.append(importReportOnlyByClass(cm));
     const flagged = (cm.imported && Array.isArray(cm.imported.rows) ? cm.imported.rows : []).filter((x) => Array.isArray(x.flags) && x.flags.length);
     card.append(importExpandable('Underpayment and rate flags', flagged.length, () =>
       importObjTable(flagged, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'computed_rate', label: 'Computed rate', cls: 'num' }, { key: 'imported_rate', label: 'Paid rate', cls: 'num' },
@@ -3303,6 +3432,7 @@ function importResultsCard(job, report, email, reportUrl, reportStatus, purgedAt
   card.append(importExpandable('Sparse penders (no payment schedule)', ((report.penders || {}).sparse || []).length, () =>
     importObjTable((report.penders || {}).sparse, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Status' }])));
 
+  card.append(el('div', { style: 'margin-top:10px' }, importReconciliation(report.listing_reconciliation)));
   card.append(el('div', { style: 'margin-top:12px' }, importReportLink(reportUrl, reportStatus, purgedAt)));
   card.append(importExpandable('Dry-run report (as approved)', 1, () => importRenderReport(report), { plain: 'The full report the import was approved on.', countText: 'expand' }));
   if (report.finished_at) card.append(el('p', { class: 'muted small', style: 'margin-top:8px', text: 'Finished ' + fmtDateTime(report.finished_at) + '.' }));
