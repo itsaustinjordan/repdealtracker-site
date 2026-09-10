@@ -2309,6 +2309,7 @@ const IMPORT_KIND_LABELS = {
   dashboardDealType: 'Deal type (dashboard)', dashboardPenderStatus: 'Pender status (dashboard)',
   tradeEquity: 'Trade equity', tombstoneDealType: 'Tombstone deal type',
   tombstoneCancelReason: 'Tombstone cancel reason', cookie: 'Dashboard session cookie',
+  scrapeIncomplete: 'Scrape incomplete',
 };
 
 // What to do next, per failure code the runner records (tool/import-rep.js
@@ -3179,8 +3180,8 @@ function importRenderReport(r) {
   misc.append(el('h3', { style: 'margin-bottom:8px' }, 'Noticed on the way ',
     tip('The lists the CLI prints after the candidates: accounts it could not scrape (enter those by hand after the import), dead never-paid contracts imported as tombstones, split groups, borderline cancels, and the decisions you made.')));
   misc.append(importExpandable('Could not scrape (manual entry after import)', (r.could_not_scrape || []).length, () =>
-    importObjTable(r.could_not_scrape, [{ key: 'account', label: 'Account' }, { key: 'deal_date', label: 'Deal date' }, { key: 'owner', label: 'Owner' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'report_bucket', label: 'Report bucket' }, { key: 'report_amount', label: 'Report amount', cls: 'num' }]),
-    { plain: 'Accounts in the PDF that the dashboard no longer returns. They are not imported; enter them in the app by hand.' }));
+    importObjTable(r.could_not_scrape, [{ key: 'account', label: 'Account' }, { key: 'deal_date', label: 'Deal date' }, { key: 'owner', label: 'Owner' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'report_bucket', label: 'Report bucket' }, { key: 'report_amount', label: 'Report amount', cls: 'num' }, { key: 'reason', label: 'Why' }]),
+    { plain: 'Accounts in the PDF that the dashboard did not return, or kept erroring on after the retry rounds (the operator chose to proceed). They are not imported; enter them in the app by hand.' }));
   misc.append(importExpandable('Unpaid tombstones', (r.tombstones || []).length, () =>
     importObjTable(r.tombstones, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'deal_date', label: 'Deal date' }, { key: 'deal_type', label: 'Type' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'amount', label: 'Amount', cls: 'num' }, { key: 'cancel_reason', label: 'Cancel reason' }]),
     { plain: 'Dead, never-paid contracts the dashboard no longer returns. They ARE imported, as $0 cancelled deals, so the book stays complete. Do not enter these by hand.' }));
@@ -3262,14 +3263,14 @@ function importResultsCard(job, report, email, reportUrl, reportStatus, purgedAt
   card.append(importExpandable('Missing deals: enter these by hand', manualRows.length, () => {
     const wrap = el('div', {});
     wrap.append(buildTable(
-      [{ label: '' }, { label: 'Account' }, { label: 'Deal date' }, { label: 'Owner' }, { label: 'Volume', cls: 'num' }, { label: 'Report bucket' }, { label: 'Report amount', cls: 'num' }],
+      [{ label: '' }, { label: 'Account' }, { label: 'Deal date' }, { label: 'Owner' }, { label: 'Volume', cls: 'num' }, { label: 'Report bucket' }, { label: 'Report amount', cls: 'num' }, { label: 'Why', tip: 'No match: the dashboard has no record for the account. Scrape error: the dashboard kept failing on it after the retry rounds and the operator chose to proceed, so it was never scraped.' }],
       manualRows.map((m) => ({ cells: [el('input', { type: 'checkbox', title: 'Entered (this checkbox is only a reading aid; it is not saved)' }),
-        el('span', { class: 'mono-sm', text: m.account }), m.deal_date ? fmtISODate(m.deal_date) : '—', m.owner || '—', m.volume == null ? '—' : money(m.volume), m.report_bucket || '—', m.report_amount == null ? '—' : money(m.report_amount)] })),
+        el('span', { class: 'mono-sm', text: m.account }), m.deal_date ? fmtISODate(m.deal_date) : '—', m.owner || '—', m.volume == null ? '—' : money(m.volume), m.report_bucket || '—', m.report_amount == null ? '—' : money(m.report_amount), m.reason || 'no match on the dashboard'] })),
       { noCollapse: true }));
     wrap.append(el('div', { class: 'btn-row' }, el('button', { class: 'btn btn-small', onclick: () =>
-      downloadBlob('manual-entry-' + String(email).replace(/[^a-z0-9.@-]+/gi, '_') + '.csv', 'text/csv', toCSV(manualRows.map((m) => ({ account: m.account, deal_date: m.deal_date || '', owner: m.owner || '', volume: m.volume == null ? '' : m.volume, report_bucket: m.report_bucket || '', report_amount: m.report_amount == null ? '' : m.report_amount })))) }, '⬇ CSV')));
+      downloadBlob('manual-entry-' + String(email).replace(/[^a-z0-9.@-]+/gi, '_') + '.csv', 'text/csv', toCSV(manualRows.map((m) => ({ account: m.account, deal_date: m.deal_date || '', owner: m.owner || '', volume: m.volume == null ? '' : m.volume, report_bucket: m.report_bucket || '', report_amount: m.report_amount == null ? '' : m.report_amount, why: m.reason || 'no match on the dashboard' })))) }, '⬇ CSV')));
     return wrap;
-  }, { plain: 'Accounts from the PDF that the dashboard no longer returns, minus the ones imported as tombstones. They are not on the account: enter each one in the app by hand.',
+  }, { plain: 'Accounts from the PDF that the dashboard did not return (no match) or kept erroring on (scrape error, operator chose to proceed), minus the ones imported as tombstones. They are not on the account: enter each one in the app by hand.',
     badge: manualRows.length ? severityBadge('warn') : null }));
 
   // unmatched commission rows + review flags
