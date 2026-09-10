@@ -2314,7 +2314,7 @@ const IMPORT_KIND_LABELS = {
 // What to do next, per failure code the runner records (tool/import-rep.js
 // fail() codes + runner/index.js). Anything else gets the default line.
 const IMPORT_FAIL_ADVICE = {
-  contract_violation: 'Nothing was written. Fix the rows or rules the report names, then create a new import with the same PDFs.',
+  contract_violation: 'Nothing was written. The refused rows are listed above; fix the cause (often an answer to a question, or a rule), then create a new import with the same PDFs.',
   insert_failed: 'Some rows may have landed. Create a new import with the same PDFs: dedupe skips every deal already on the account, so nothing is duplicated.',
   commission_parse_failed: 'Nothing was written. Re-export the commission report from Westgate and create a new import.',
   pdf_parse_failed: 'Nothing was written. Re-export the all-deals PDF from Westgate and create a new import.',
@@ -2802,6 +2802,7 @@ function toolsImportDetail(routeJobId) {
       el('div', { class: 'callout-body' },
         el('strong', {}, 'Failed ', el('span', { class: 'badge badge-danger', text: job.error_code || 'unknown' })),
         el('pre', { class: 'imp-detail-pre', text: job.error_detail || 'No detail recorded.' }),
+        importContractViolations(report),
         el('p', { class: 'strong', style: 'margin-top:8px', text: 'What to do: ' + (IMPORT_FAIL_ADVICE[job.error_code] || IMPORT_FAIL_DEFAULT) }))));
   } else if (job.status === 'aborted') {
     root.append(el('div', { class: 'callout callout-warning' },
@@ -2861,6 +2862,16 @@ function toolsImportDetail(routeJobId) {
   // -- actions --
   root.append(importActionsCard(job, email, purgedAt));
   return root;
+}
+
+// The rows the data-model contract refused (report.contract.violations), for
+// the failed screen. Null when the report carries none.
+function importContractViolations(report) {
+  const v = report && report.contract && Array.isArray(report.contract.violations) ? report.contract.violations : [];
+  if (!v.length) return null;
+  return el('div', { style: 'margin-top:10px' },
+    el('p', { class: 'strong', text: intFmt(v.length) + ' contract violation(s), the rows the runner refused to insert:' }),
+    importObjTable(v, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'message', label: 'Message' }]));
 }
 
 function importReportLink(url, status, purgedAt) {
