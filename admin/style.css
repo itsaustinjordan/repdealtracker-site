@@ -717,6 +717,35 @@ th.sortable:hover { color: var(--text); }
   .edit-grid .edit-label { margin-top: 8px; }
 }
 
+/* ---- Import (Tools → Import) ---- */
+.imp-intro ol { margin: 8px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.upload-row { display: flex; flex-direction: column; gap: 6px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.upload-row:last-of-type { border-bottom: 0; }
+.upload-name { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: var(--fs-sm); }
+.imp-health { font-size: var(--fs-sm); margin: 0; }
+.health-ok { color: var(--success); font-weight: 600; }
+.health-bad { color: var(--danger); font-weight: 650; }
+.health-wait { color: var(--text-2); }
+.phase-track { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+.phase-chip { font-size: var(--fs-xs); font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--text-3); border: 1px solid transparent; }
+.phase-chip.past { color: var(--success); background: var(--success-tint); }
+.phase-chip.current { color: var(--accent); background: var(--accent-tint); border-color: var(--accent-border); }
+.imp-line { font-size: var(--fs-md); font-weight: 600; margin: 4px 0 8px; overflow-wrap: anywhere; }
+.count-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.count-chips span { background: var(--surface-2); border-radius: 999px; padding: 2px 9px; font-size: var(--fs-xs); font-variant-numeric: tabular-nums; color: var(--text-2); }
+.imp-detail-pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; color: var(--text); }
+.q-card { border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); background: var(--surface); }
+.q-card + .q-card { margin-top: var(--sp-3); }
+.q-open { border-left: 3px solid var(--warning); }
+.q-answered { opacity: 0.8; padding: var(--sp-3) var(--sp-4); }
+.q-title { font-weight: 650; margin-bottom: 6px; overflow-wrap: anywhere; }
+.q-details { color: var(--text-2); font-size: var(--fs-sm); margin: 0 0 8px; padding-left: 20px; display: flex; flex-direction: column; gap: 3px; }
+.q-ctx { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.q-ctx span { background: var(--surface-2); border-radius: 6px; padding: 3px 8px; font-size: var(--fs-xs); overflow-wrap: anywhere; max-width: 100%; }
+.q-question { font-size: var(--fs-sm); font-weight: 650; margin-bottom: 8px; }
+.opt-group { display: flex; flex-wrap: wrap; gap: 8px; }
+.opt-btn { text-align: left; white-space: normal; max-width: 100%; }
+
 /* responsive shell */
 @media (max-width: 900px) {
   #sidebar {

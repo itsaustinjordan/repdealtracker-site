@@ -406,8 +406,13 @@ window.DT.onRoute = (route) => {
   if (route.name === 'log' && C.log === null) loadLog(false);
   if (route.name === 'settings') { loadConfig(true); loadClientConfig(true); loadAdmins(false); }
   if (route.name === 'tools') {
-    state.toolsTab = ['integrity', 'storage', 'data'].includes(route.args[0]) ? route.args[0] : state.toolsTab;
+    state.toolsTab = ['integrity', 'storage', 'data', 'import'].includes(route.args[0]) ? route.args[0] : state.toolsTab;
     if (state.toolsTab === 'data') loadTables(false);
+    // tools/import → list + create (15 s list poll); tools/import/<job> →
+    // detail (5 s poll while live). Any other tab stops the import timers.
+    if (state.toolsTab === 'import') importOnRoute(route.args[1] || null); else importLeave();
+  } else if (route.name !== 'deal') {
+    importLeave();
   }
   if (route.name === 'user') {
     const userId = route.args[0];
@@ -2031,14 +2036,18 @@ function viewStats() {
 function viewTools() {
   const wrap = el('div', {});
   wrap.append(el('div', { class: 'page-head' }, el('h1', { text: 'Tools' })));
-  wrap.append(purpose('Deeper maintenance: data consistency checks across every account, storage cleanup, and database housekeeping.'));
+  wrap.append(purpose('Deeper maintenance: data consistency checks across every account, storage cleanup, database housekeeping, and importing a rep’s Westgate history.'));
 
-  const tabs = [['integrity', 'Integrity'], ['storage', 'Storage'], ['data', 'Data']];
+  const tabs = [['integrity', 'Integrity'], ['storage', 'Storage'], ['data', 'Data'], ['import', 'Import']];
   wrap.append(el('div', { class: 'subtabs' }, tabs.map(([id, label]) =>
     el('button', { class: 'subtab' + (state.toolsTab === id ? ' active' : ''), onclick: () => nav('tools/' + id) }, label))));
 
+  // The deal drawer layers over the tools base route: read the job id from
+  // whichever route is actually the tools one.
+  const base = state.route.name === 'deal' ? (state.baseRoute || state.route) : state.route;
   if (state.toolsTab === 'storage') wrap.append(toolsStorage());
   else if (state.toolsTab === 'data') wrap.append(toolsData());
+  else if (state.toolsTab === 'import') wrap.append(base.args[1] ? toolsImportDetail(base.args[1]) : toolsImport());
   else wrap.append(toolsIntegrity());
   return wrap;
 }
@@ -2270,6 +2279,1107 @@ function toolsData() {
   pruneCard.append(mkPrune('audit_log', 'audit history', 'Restore snapshots older than the cutoff are destroyed with it — deleted deals from before the cutoff can never be restored again, and the storage janitor’s image protection for those older deletions lapses with them (their photos become deletable orphans).'));
   root.append(pruneCard);
   return root;
+}
+
+// ---------------------------------------------------------------------------
+// TOOLS → IMPORT (import-in-panel: the SPEC §3.11b CLI as a background job)
+// Every shape here is the deployed contract, never guessed: admin-api's
+// import actions (import_upload_url, create_import_job, list_import_jobs,
+// get_import_job, answer_import_question, approve_import_job,
+// abort_import_job, purge_import_job) and the runner's writers
+// (dealtracker-import-runner runner/ctx.js: progress {phase, line, counts,
+// updated_at}, questions {kind, payload, options:[{key,label}]}, heartbeat
+// every 30 s; tool/import-rep.js buildReportData → the report jsonb at
+// awaiting_review, insertAndReconcile → report.insert / report.reconcile /
+// report.post_contract at done).
+// ---------------------------------------------------------------------------
+const IMPORT_LIVE_STATUSES = ['queued', 'running', 'awaiting_input', 'awaiting_review', 'approved', 'inserting'];
+const IMPORT_TERMINAL_STATUSES = ['done', 'failed', 'aborted'];
+// approved / inserting refuse to abort (admin-api answers not_abortable): a
+// half-imported book would be indistinguishable from a crash. The button hides.
+const IMPORT_ABORTABLE_STATUSES = ['queued', 'running', 'awaiting_input', 'awaiting_review'];
+const IMPORT_DETAIL_POLL_MS = 5000;
+const IMPORT_LIST_POLL_MS = 15000;
+const IMPORT_RUNNER_STALE_MS = 2 * 60 * 1000; // the runner heartbeats every 30 s
+const IMPORT_PHASES = ['claimed', 'download', 'validate', 'parse', 'dedupe', 'login', 'scrape', 'transform', 'report', 'review', 'insert', 'reconcile', 'done'];
+
+const IMPORT_KIND_LABELS = {
+  division: 'Market division', status: 'Cancel status', mismatch: 'PDF vs dashboard',
+  blocking: 'Cannot classify', penderLiveness: 'Pender liveness',
+  dashboardDealType: 'Deal type (dashboard)', dashboardPenderStatus: 'Pender status (dashboard)',
+  tradeEquity: 'Trade equity', tombstoneDealType: 'Tombstone deal type',
+  tombstoneCancelReason: 'Tombstone cancel reason', cookie: 'Dashboard session cookie',
+};
+
+// What to do next, per failure code the runner records (tool/import-rep.js
+// fail() codes + runner/index.js). Anything else gets the default line.
+const IMPORT_FAIL_ADVICE = {
+  contract_violation: 'Nothing was written. Fix the rows or rules the report names, then create a new import with the same PDFs.',
+  insert_failed: 'Some rows may have landed. Create a new import with the same PDFs: dedupe skips every deal already on the account, so nothing is duplicated.',
+  commission_parse_failed: 'Nothing was written. Re-export the commission report from Westgate and create a new import.',
+  pdf_parse_failed: 'Nothing was written. Re-export the all-deals PDF from Westgate and create a new import.',
+  pdf_missing: 'Nothing was written. The uploaded PDF could not be read on the runner. Upload it again in a new import.',
+  scrape_no_session: 'Nothing was written. The dashboard session could not be refreshed mid-scrape. Create a new import; the runner asks for a cookie here if the automatic login fails.',
+  no_session: 'Nothing was written. No dashboard session could be obtained after three cookie attempts. Check the runner’s Westgate credentials, then create a new import.',
+  target_user_missing: 'Nothing was written. The target account no longer exists.',
+  resume_checkpoint_missing: 'The runner restarted mid-insert and its saved insert plan was gone. Check what landed on the account before creating a new import.',
+  job_state_lost: 'The job row changed under the runner. Check the account, then create a new import if needed.',
+  runner_crash: 'The runner hit an unexpected error. Check its logs (fly logs -a dealtracker-import-runner), then create a new import.',
+  runner_bug: 'The runner hit an internal error. Check its logs (fly logs -a dealtracker-import-runner).',
+};
+const IMPORT_FAIL_DEFAULT = 'Nothing is written before approval. Check the runner logs (fly logs -a dealtracker-import-runner) and create a new import.';
+
+// Working state. Module-level so re-renders never lose a chosen file or a
+// half-typed answer; timers stop the moment the route leaves the tab.
+const IMP = {
+  jobs: null, jobsErr: '', jobsSig: '', listTimer: null, usersErr: '',
+  detail: null,   // { jobId, data, err, timer, sig, drafts, msgs, busy, healthEl }
+  create: importFreshCreate(),
+};
+
+function importFreshCreate() {
+  return { targetId: '', history: null, commission: null, uploads: null, busy: false, err: '', errJobId: null };
+}
+
+function importStatusBadge(status) {
+  const cls = status === 'done' ? 'badge-success'
+    : status === 'failed' ? 'badge-danger'
+      : (status === 'awaiting_input' || status === 'awaiting_review') ? 'badge-warning'
+        : (status === 'running' || status === 'approved' || status === 'inserting') ? 'badge-accent'
+          : 'badge-neutral'; // queued, aborted; an unknown value renders as itself
+  return el('span', { class: 'badge ' + cls, text: humanize(status || '—') });
+}
+
+function importKindLabel(kind) { return IMPORT_KIND_LABELS[kind] || String(kind); }
+function importBasename(p) { return p ? String(p).split('/').pop() : '—'; }
+function importOnList() { return state.view === 'panel' && state.route.name === 'tools' && state.toolsTab === 'import' && !state.route.args[1]; }
+function importOnDetail(jobId) { return state.view === 'panel' && state.route.name === 'tools' && state.toolsTab === 'import' && state.route.args[1] === jobId; }
+
+// ---- loaders + polling ------------------------------------------------------
+function importJobsSig(jobs) {
+  return (jobs || []).map((j) => j.id + ':' + j.status + ':' + j.updated_at + ':' + j.open_question_count).join(',');
+}
+
+async function loadImportJobs(force) {
+  if (IMP.jobs && !force) return;
+  IMP.jobsErr = '';
+  if (force) IMP.jobs = null;
+  rerender('tools');
+  try {
+    const resp = await adminApi('list_import_jobs', { limit: 50 });
+    IMP.jobs = (resp && resp.jobs) || [];
+    IMP.jobsSig = importJobsSig(IMP.jobs);
+  } catch (e) {
+    if (e.handled) return;
+    IMP.jobs = IMP.jobs || [];
+    IMP.jobsErr = e.message;
+  }
+  rerender('tools');
+}
+
+function importStartListPoll() {
+  importStopListPoll();
+  IMP.listTimer = setInterval(importListTick, IMPORT_LIST_POLL_MS);
+}
+function importStopListPoll() {
+  if (IMP.listTimer) clearInterval(IMP.listTimer);
+  IMP.listTimer = null;
+}
+async function importListTick() {
+  if (!importOnList()) { importStopListPoll(); return; }
+  if (IMP.create.busy || !IMP.jobs || !IMP.jobs.some((j) => IMPORT_LIVE_STATUSES.includes(j.status))) return;
+  try {
+    const resp = await adminApi('list_import_jobs', { limit: 50 });
+    if (!importOnList()) return;
+    const jobs = (resp && resp.jobs) || [];
+    const sig = importJobsSig(jobs);
+    if (sig !== IMP.jobsSig) { IMP.jobs = jobs; IMP.jobsSig = sig; IMP.jobsErr = ''; rerender('tools'); }
+  } catch (e) {
+    if (e.handled) importStopListPoll();
+    // a transient failure keeps the last good list; the next tick retries
+  }
+}
+
+function importDetailSig(resp) {
+  const j = (resp && resp.job) || {};
+  const qs = ((resp && resp.questions) || []).map((q) => q.id + ':' + (q.answered_at || '')).join(',');
+  return [j.status, j.phase, j.updated_at, j.heartbeat_at, (j.progress && j.progress.updated_at) || '',
+    j.report_text_path || '', (resp && resp.report_text_status) || '', j.error_code || '', qs].join('|');
+}
+
+async function importRefreshDetail() {
+  const d = IMP.detail;
+  if (!d) return;
+  d.busy = true;
+  try {
+    const resp = await adminApi('get_import_job', { job_id: d.jobId });
+    if (IMP.detail !== d) return;
+    d.data = resp;
+    d.sig = importDetailSig(resp);
+    d.err = '';
+    if (IMPORT_LIVE_STATUSES.includes(resp.job.status)) importStartDetailPoll(); else importStopDetailPoll();
+  } catch (e) {
+    if (IMP.detail !== d || e.handled) return;
+    d.err = e.message;
+  } finally {
+    if (IMP.detail === d) d.busy = false;
+  }
+  rerender('tools');
+}
+
+function importStartDetailPoll() {
+  if (!IMP.detail) return;
+  if (IMP.detail.timer) return;
+  IMP.detail.timer = setInterval(importDetailTick, IMPORT_DETAIL_POLL_MS);
+}
+function importStopDetailPoll() {
+  if (IMP.detail && IMP.detail.timer) clearInterval(IMP.detail.timer);
+  if (IMP.detail) IMP.detail.timer = null;
+}
+async function importDetailTick() {
+  const d = IMP.detail;
+  if (!d || !importOnDetail(d.jobId)) { importStopDetailPoll(); return; }
+  if (d.busy) return;
+  d.busy = true;
+  try {
+    const resp = await adminApi('get_import_job', { job_id: d.jobId });
+    if (IMP.detail !== d) return;
+    const sig = importDetailSig(resp);
+    d.err = '';
+    if (sig !== d.sig) {
+      d.sig = sig;
+      d.data = resp;
+      rerender('tools');
+    } else {
+      importPaintHealth(d); // "last seen" keeps counting even when nothing else moved
+    }
+    if (IMPORT_TERMINAL_STATUSES.includes(resp.job.status)) importStopDetailPoll();
+  } catch (e) {
+    if (IMP.detail !== d) return;
+    if (e.handled) { importStopDetailPoll(); return; }
+    d.err = e.message;
+    importPaintHealth(d);
+  } finally {
+    if (IMP.detail === d) d.busy = false;
+  }
+}
+
+function importOnRoute(jobId) {
+  if (C.users === null && !IMP.usersErr) {
+    ensureUsers().then(() => rerender('tools')).catch((e) => { if (!e.handled) { IMP.usersErr = e.message; rerender('tools'); } });
+  }
+  if (jobId) {
+    importStopListPoll();
+    if (!IMP.detail || IMP.detail.jobId !== jobId) {
+      importStopDetailPoll();
+      IMP.detail = { jobId, data: null, err: '', timer: null, sig: '', drafts: {}, msgs: {}, busy: false, healthEl: null };
+    }
+    importRefreshDetail();
+  } else {
+    importStopDetailPoll();
+    IMP.detail = null;
+    loadImportJobs(false);
+    importStartListPoll();
+  }
+}
+
+function importLeave() {
+  importStopListPoll();
+  importStopDetailPoll();
+}
+
+// ---- upload (signed URL PUT with progress) -----------------------------------
+function importPutSigned(signedUrl, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', signedUrl);
+    xhr.setRequestHeader('Content-Type', 'application/pdf');
+    xhr.upload.addEventListener('progress', (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); });
+    xhr.addEventListener('load', () => {
+      if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
+      let detail = '';
+      try { const b = JSON.parse(xhr.responseText); detail = b.message || b.error || ''; } catch (e) { /* not JSON */ }
+      reject(new Error('Upload failed (HTTP ' + xhr.status + ')' + (detail ? ': ' + detail : '')));
+    });
+    xhr.addEventListener('error', () => reject(new Error('Upload failed: network error. Check the connection and try again.')));
+    xhr.addEventListener('abort', () => reject(new Error('Upload cancelled.')));
+    xhr.send(file);
+  });
+}
+
+function importPaintUpload(kind) {
+  const u = IMP.create.uploads && IMP.create.uploads[kind];
+  if (!u || !u.el || !u.el.isConnected) return;
+  u.el.bar.style.width = Math.round(u.pct * 100) + '%';
+  u.el.status.textContent = u.status + (u.pct > 0 && u.pct < 1 ? ' ' + Math.round(u.pct * 100) + '%' : '');
+}
+
+async function importUploadOne(kind, file) {
+  const u = IMP.create.uploads[kind];
+  u.status = 'Requesting an upload URL…';
+  importPaintUpload(kind);
+  const resp = await adminApi('import_upload_url', { filename: file.name });
+  u.status = 'Uploading';
+  importPaintUpload(kind);
+  await importPutSigned(resp.signed_url, file, (frac) => { u.pct = frac; importPaintUpload(kind); });
+  u.pct = 1;
+  u.status = 'Uploaded';
+  importPaintUpload(kind);
+  return resp.path;
+}
+
+function importFindActiveJob(targetId) {
+  return (IMP.jobs || []).find((j) => j.target_user_id === targetId && IMPORT_LIVE_STATUSES.includes(j.status)) || null;
+}
+
+async function importCreateJob() {
+  const c = IMP.create;
+  c.err = '';
+  c.errJobId = null;
+  const target = (C.users || []).find((u) => u.user_id === c.targetId);
+  if (!target) { c.err = 'Choose the target user first.'; rerender('tools'); return; }
+  if (!c.history) { c.err = 'Choose the all-deals history PDF. It is required.'; rerender('tools'); return; }
+  for (const f of [c.history, c.commission]) {
+    if (f && !/\.pdf$/i.test(f.name)) { c.err = 'Only PDF files are accepted: “' + f.name + '” does not end in .pdf.'; rerender('tools'); return; }
+  }
+  if (c.commission && c.commission.name === c.history.name && c.commission.size === c.history.size) {
+    c.err = 'The commission report must be a different file from the history PDF.';
+    rerender('tools');
+    return;
+  }
+  c.busy = true;
+  c.uploads = {
+    history: { pct: 0, status: 'Waiting', el: null },
+    commission: c.commission ? { pct: 0, status: 'Waiting', el: null } : null,
+  };
+  rerender('tools');
+  try {
+    const historyPath = await importUploadOne('history', c.history);
+    const commissionPath = c.commission ? await importUploadOne('commission', c.commission) : null;
+    const resp = await adminApi('create_import_job', {
+      target_user_id: c.targetId,
+      pdf_history_path: historyPath,
+      pdf_commission_path: commissionPath,
+    });
+    const job = resp && resp.job;
+    toast('ok', 'Import queued for ' + (target.email || target.user_id) + '. The runner picks it up within about 20 seconds.');
+    IMP.create = importFreshCreate();
+    IMP.jobs = null;
+    if (job && job.id) nav('tools/import/' + job.id); else nav('tools/import');
+  } catch (e) {
+    c.busy = false;
+    c.uploads = null;
+    if (e.handled) return;
+    if (e.code === 'job_active') {
+      c.err = e.message;
+      try { await loadImportJobs(true); } catch (e2) { /* the list refresh is best-effort */ }
+      const active = importFindActiveJob(c.targetId);
+      c.errJobId = active ? active.id : null;
+    } else if (e.code === 'missing_upload') {
+      c.err = 'The upload did not land in the bucket (' + e.message + '). Choose the file again and retry.';
+    } else if (e.code === 'user_not_found') {
+      c.err = 'That user no longer exists. Refresh the roster and choose again.';
+    } else {
+      c.err = e.message;
+    }
+    rerender('tools');
+  }
+}
+
+// ---- list + create view -----------------------------------------------------
+function toolsImport() {
+  const root = el('div', {});
+  root.append(el('p', { class: 'muted small', style: 'margin-bottom:12px;max-width:70ch' },
+    'Bring a rep’s Westgate history into their account as a background job: upload the PDFs, answer the runner’s questions here, read the dry-run report, then approve. Nothing is written until you type IMPORT on that report.'));
+  root.append(importCreateCard());
+  root.append(importJobsCard());
+  return root;
+}
+
+function importCreateCard() {
+  const c = IMP.create;
+  const card = el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'New import' }),
+      tip('The same pipeline as the operator CLI: parse the all-deals PDF, scrape each account on the Westgate dashboard, classify and price every deal, then stop for your approval. The runner on Fly.io does the work; this panel is only where you answer and approve.')));
+
+  card.append(el('div', { class: 'callout callout-info', style: 'margin-bottom:14px' },
+    el('div', { class: 'callout-body imp-intro' },
+      el('strong', { text: 'What an import does' }),
+      'It reads the rep’s Westgate all-deals PDF, scrapes each account from the dashboard, classifies every deal (new or upgrade, pender or full down, earned, pending, or cancelled), prices the commission, and builds a dry-run report. Nothing is written to the account until you approve that report by typing IMPORT. Until then the job can be aborted at any time.',
+      el('ol', {},
+        el('li', {}, el('b', { text: 'All-deals history PDF (required): ' }), 'the rep’s deal history export from the Westgate dashboard.'),
+        el('li', {}, el('b', { text: 'Commission report PDF (optional): ' }), 'the rep’s paid-commission report. With it, paid amounts override the computed ones and the report gains the commission cross-checks and the unmatched-rows list.')))));
+
+  // -- target user --
+  const sel = el('select', { disabled: c.busy || C.users === null, style: 'min-width:260px;max-width:100%' });
+  sel.append(el('option', { value: '', text: C.users === null ? (IMP.usersErr ? 'Roster failed to load' : 'Loading users…') : 'Choose the target user…' }));
+  const roster = (C.users || []).slice().sort((a, b) => (a.email || '').localeCompare(b.email || ''));
+  for (const u of roster) {
+    sel.append(el('option', { value: u.user_id, text: (u.email || u.user_id) + ' · ' + intFmt(u.deal_count) + ' deals' + (u.banned ? ' · banned' : '') }));
+  }
+  sel.value = c.targetId;
+  if (sel.value !== c.targetId) { c.targetId = ''; sel.value = ''; }
+  sel.addEventListener('change', () => { c.targetId = sel.value; c.err = ''; c.errJobId = null; });
+  card.append(el('div', { class: 'field', style: 'margin-bottom:12px' },
+    el('span', {}, el('span', { class: 'strong', text: 'Target user ' }), tip('The account the deals are inserted into after approval. One live import per user: a second one for the same account is refused until the first finishes or is aborted.')),
+    sel,
+    IMP.usersErr ? el('span', { class: 'msg msg-err', text: 'Could not load the roster: ' + IMP.usersErr }) : null));
+
+  // -- file pickers --
+  const picker = (kind, label, tipText, required) => {
+    const file = c[kind];
+    const input = el('input', { type: 'file', accept: '.pdf,application/pdf', style: 'display:none' });
+    input.addEventListener('change', () => {
+      c[kind] = input.files && input.files[0] ? input.files[0] : null;
+      c.err = '';
+      rerender('tools');
+    });
+    const choose = el('button', { class: 'btn btn-small', disabled: c.busy, onclick: () => input.click() }, file ? 'Change file' : 'Choose PDF');
+    const clear = file ? el('button', { class: 'btn btn-ghost btn-small', disabled: c.busy, onclick: () => { c[kind] = null; rerender('tools'); } }, '✕') : null;
+    const row = el('div', { class: 'upload-row' },
+      el('div', { class: 'upload-name' },
+        el('span', { class: 'strong', text: label }), tip(tipText),
+        required ? el('span', { class: 'badge badge-outline', text: 'required' }) : el('span', { class: 'badge badge-outline', text: 'optional' })),
+      el('div', { class: 'row' }, choose, clear, input,
+        el('span', { class: file ? 'small' : 'muted small', text: file ? file.name + ' · ' + fmtBytes(file.size) : 'No file chosen' })));
+    const u = c.uploads && c.uploads[kind];
+    if (u) {
+      const bar = el('span', { style: 'width:' + Math.round(u.pct * 100) + '%' });
+      const status = el('span', { class: 'muted small', text: u.status });
+      u.el = { bar, status };
+      row.append(el('div', { class: 'progress', style: 'max-width:420px' }, bar), status);
+    }
+    return row;
+  };
+  card.append(picker('history', 'All-deals history PDF',
+    'The Westgate dashboard’s deal-history export for this rep. Every account number in it is a candidate; the runner scrapes each one that is not already on the account.', true));
+  card.append(picker('commission', 'Commission report PDF',
+    'The rep’s paid-commission report. Optional: without it every commission is computed from the rate rules; with it, paid amounts override the computed ones and the report gains the commission cross-checks.', false));
+
+  // -- submit + inline errors --
+  const go = el('button', { class: 'btn btn-primary', disabled: c.busy || !c.history || !c.targetId }, c.busy ? 'Uploading…' : '⬆ Upload and queue import');
+  go.addEventListener('click', importCreateJob);
+  const msg = el('p', { class: 'msg' });
+  if (c.err) {
+    setMsg(msg, 'err', c.err);
+    if (c.errJobId) msg.append(' ', el('button', { class: 'btn-link', onclick: () => nav('tools/import/' + c.errJobId) }, 'Open the active job'));
+  }
+  card.append(el('div', { class: 'btn-row', style: 'margin-top:12px' }, go,
+    el('span', { class: 'muted small', text: 'Upload first, then the job is queued. The runner claims it within about 20 seconds.' })), msg);
+  return card;
+}
+
+function importJobsCard() {
+  const card = el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'Import jobs' }),
+      tip('Every import ever queued, newest first. Amber means the job is waiting on you (a question or the review). Click a row to open it.'),
+      el('span', { class: 'grow' }),
+      el('button', { class: 'btn btn-small', onclick: () => loadImportJobs(true) }, '↻ Refresh')));
+  if (IMP.jobsErr) card.append(el('p', { class: 'msg msg-err', text: IMP.jobsErr }));
+  if (IMP.jobs === null) { card.append(skeletonRows(4, 24)); return card; }
+  if (!IMP.jobs.length) {
+    card.append(emptyState('No imports yet', 'Queue one above. Jobs appear here the moment they are created.'));
+    return card;
+  }
+  card.append(buildTable(
+    [{ label: 'Status', tip: 'queued: waiting for the runner · running: working · awaiting input: a question needs you · awaiting review: the dry-run needs your IMPORT · approved / inserting: writing · done, failed, aborted: finished.' },
+      { label: 'Target' }, { label: 'Created' },
+      { label: 'Questions', tip: 'Open questions the runner is blocked on. Answer them inside the job.' },
+      { label: 'Progress' }],
+    IMP.jobs.map((j) => {
+      const p = j.progress || {};
+      return {
+        rowClass: 'clickable',
+        onclick: () => nav('tools/import/' + j.id),
+        cells: [
+          importStatusBadge(j.status),
+          el('span', {}, j.target_email || el('span', { class: 'mono-sm', text: truncate(j.target_user_id, 13) }),
+            el('span', { class: 'cell-sub', text: 'by ' + (j.created_by_email || '—') })),
+          relTimeEl(j.created_at),
+          j.open_question_count > 0
+            ? el('span', { class: 'badge badge-warning', text: intFmt(j.open_question_count) + ' open' })
+            : el('span', { class: 'muted', text: '—' }),
+          el('span', { class: 'params-cell', text: truncate(p.line || '—', 110), title: p.line || null }),
+        ],
+      };
+    })));
+  if (IMP.jobs.some((j) => IMPORT_LIVE_STATUSES.includes(j.status))) {
+    card.append(el('p', { class: 'muted small', style: 'margin-top:8px', text: 'Refreshes every 15 seconds while a job is live.' }));
+  }
+  return card;
+}
+
+// ---- detail view -------------------------------------------------------------
+function importHealth(job) {
+  if (IMPORT_TERMINAL_STATUSES.includes(job.status)) {
+    return { cls: 'muted small', text: 'Finished ' + relTime(job.updated_at) + (job.runner_id ? ' · runner ' + job.runner_id : '') };
+  }
+  if (job.status === 'queued') {
+    return { cls: 'health-wait', text: 'Waiting for the runner to claim this job. It checks for new jobs every 20 seconds.' };
+  }
+  const hb = job.heartbeat_at ? Date.parse(job.heartbeat_at) : NaN;
+  if (isNaN(hb)) return { cls: 'health-bad', text: 'Runner offline. It never checked in on this job.' };
+  const age = Date.now() - hb;
+  if (age > IMPORT_RUNNER_STALE_MS) {
+    return { cls: 'health-bad', text: 'Runner offline. Last seen ' + relTime(job.heartbeat_at) + '. The job resumes under the crash law when the runner comes back.' };
+  }
+  return { cls: 'health-ok', text: 'Runner online · checked in ' + relTime(job.heartbeat_at) + (job.runner_id ? ' · ' + job.runner_id : '') };
+}
+
+function importPaintHealth(d) {
+  if (!d || !d.data || !d.healthEl || !d.healthEl.isConnected) return;
+  const h = importHealth(d.data.job);
+  d.healthEl.className = 'imp-health ' + h.cls;
+  d.healthEl.textContent = h.text + (d.err ? ' · refresh failed: ' + d.err : '');
+}
+
+function importCountsChips(counts) {
+  const entries = Object.entries(counts || {}).filter(([, v]) => v !== null && typeof v !== 'object');
+  if (!entries.length) return null;
+  return el('div', { class: 'count-chips' }, entries.map(([k, v]) =>
+    el('span', {}, el('b', { text: humanize(k) + ' ' }), typeof v === 'number' ? intFmt(v) : String(v))));
+}
+
+function importPhaseTrack(job) {
+  const cur = job.phase || (job.progress && job.progress.phase) || null;
+  const idx = IMPORT_PHASES.indexOf(cur);
+  const track = el('div', { class: 'phase-track' });
+  if (idx === -1) {
+    track.append(el('span', { class: 'phase-chip current', text: cur ? humanize(cur) : (job.status === 'queued' ? 'queued' : '—') }));
+    return track;
+  }
+  IMPORT_PHASES.forEach((ph, i) => {
+    track.append(el('span', { class: 'phase-chip' + (i < idx ? ' past' : i === idx ? ' current' : ''), text: ph }));
+  });
+  return track;
+}
+
+function toolsImportDetail(routeJobId) {
+  const d = IMP.detail && IMP.detail.jobId === routeJobId ? IMP.detail : null;
+  const root = el('div', {});
+  root.append(el('div', { class: 'row', style: 'margin-bottom:12px' },
+    el('button', { class: 'btn btn-small', onclick: () => nav('tools/import') }, '← All imports'),
+    el('button', { class: 'btn btn-small', disabled: !d || d.busy, onclick: importRefreshDetail }, '↻ Refresh')));
+  if (!d || !d.data) {
+    if (d && d.err) root.append(el('p', { class: 'msg msg-err', text: d.err }));
+    else root.append(skeletonRows(6, 22));
+    return root;
+  }
+  const { job, target_email: targetEmail, questions, report_text_url: reportUrl, report_text_status: reportStatus } = d.data;
+  const email = targetEmail || job.target_user_id;
+  const report = job.report && typeof job.report === 'object' ? job.report : null;
+  const p = job.progress || {};
+  const purgedAt = typeof p.purged_at === 'string' ? p.purged_at : null;
+
+  // -- header --
+  const health = importHealth(job);
+  d.healthEl = el('p', { class: 'imp-health ' + health.cls, text: health.text + (d.err ? ' · refresh failed: ' + d.err : '') });
+  root.append(el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'Import into ' + email }), importStatusBadge(job.status),
+      tip('One job, end to end: queued, running, awaiting input (a question), awaiting review (the dry-run), approved and inserting (writing), then done, failed, or aborted. This screen refreshes every 5 seconds while the job is live.')),
+    el('dl', { class: 'agg-grid', style: 'margin-bottom:12px' },
+      el('div', { class: 'agg-item' }, el('dt', { text: 'Created' }), el('dd', {}, relTimeEl(job.created_at))),
+      el('div', { class: 'agg-item' }, el('dt', { text: 'Created by' }), el('dd', { text: job.created_by_email || '—' })),
+      el('div', { class: 'agg-item' }, el('dt', { text: 'History PDF' }), el('dd', { text: importBasename(job.pdf_history_path), title: job.pdf_history_path })),
+      el('div', { class: 'agg-item' }, el('dt', { text: 'Commission report' }), el('dd', { text: job.pdf_commission_path ? importBasename(job.pdf_commission_path) : 'none', title: job.pdf_commission_path || null })),
+      el('div', { class: 'agg-item' }, el('dt', { text: 'Job id' }), el('dd', { class: 'mono-sm', text: truncate(job.id, 13), title: job.id })),
+      el('div', { class: 'agg-item' }, el('dt', { text: 'Runner' }), el('dd', { class: 'mono-sm', text: job.runner_id || 'not claimed yet' }))),
+    el('div', { class: 'row', style: 'gap:6px' }, d.healthEl,
+      tip('The runner stamps a heartbeat every 30 seconds while it owns the job, including while it waits on you. Offline means no heartbeat for over 2 minutes: the job is not lost, it resumes when the runner restarts.'))));
+
+  // -- progress --
+  root.append(el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'Progress' }),
+      tip('The runner’s own phase and status line, written as it works (throttled to every few seconds). Counts are its tallies for the current phase, for example scraped accounts or inserted rows.')),
+    importPhaseTrack(job),
+    el('p', { class: 'imp-line', text: p.line || 'No status line yet.' }),
+    el('div', { class: 'row', style: 'gap:10px' }, importCountsChips(p.counts),
+      el('span', { class: 'muted small' }, 'updated ', relTimeEl(p.updated_at || job.updated_at)))));
+
+  // -- failure / abort --
+  if (job.status === 'failed') {
+    root.append(el('div', { class: 'callout callout-danger' },
+      el('div', { class: 'callout-body' },
+        el('strong', {}, 'Failed ', el('span', { class: 'badge badge-danger', text: job.error_code || 'unknown' })),
+        el('pre', { class: 'imp-detail-pre', text: job.error_detail || 'No detail recorded.' }),
+        el('p', { class: 'strong', style: 'margin-top:8px', text: 'What to do: ' + (IMPORT_FAIL_ADVICE[job.error_code] || IMPORT_FAIL_DEFAULT) }))));
+  } else if (job.status === 'aborted') {
+    root.append(el('div', { class: 'callout callout-warning' },
+      el('div', { class: 'callout-body' },
+        el('strong', {}, 'Aborted ', el('span', { class: 'badge badge-neutral', text: job.error_code || 'aborted' })),
+        el('p', { text: job.error_detail || 'Aborted.' }),
+        el('p', { class: 'strong', style: 'margin-top:8px', text: 'Nothing was written. To try again, create a new import with the same PDFs.' }))));
+  }
+
+  // -- questions --
+  const open = (questions || []).filter((q) => !q.answered_at);
+  const answered = (questions || []).filter((q) => q.answered_at);
+  if (open.length || answered.length) {
+    const qCard = el('div', { class: 'card' },
+      el('div', { class: 'card-title' }, el('h2', { text: 'Questions' }),
+        open.length ? el('span', { class: 'badge badge-warning', text: intFmt(open.length) + ' open' }) : null,
+        tip('Anything the runner refuses to guess: an unmapped division, an unrecognized cancel status, a PDF-vs-dashboard mismatch, or a dashboard session it needs from you. The run pauses until every open question is answered; answers are remembered even if the runner restarts.')));
+    if (open.length) {
+      qCard.append(el('p', { class: 'muted small', style: 'margin-bottom:10px', text: 'The runner is paused on these. Each answer is sent immediately and picked up within about 10 seconds.' }));
+      for (const q of open) qCard.append(importOpenQuestion(q, d));
+    } else if (IMPORT_LIVE_STATUSES.includes(job.status)) {
+      qCard.append(el('p', { class: 'muted small', text: 'No open questions right now.' }));
+    }
+    if (answered.length) {
+      qCard.append(el('div', { style: 'margin-top:12px' }, importExpandable('Answered', answered.length, () =>
+        el('div', {}, answered.map((q) => importAnsweredQuestion(q))), { plain: 'Every question already answered on this job, with who answered and when.' })));
+    }
+    root.append(qCard);
+  }
+
+  // -- review gate --
+  if (job.status === 'awaiting_review') {
+    const rc = el('div', { class: 'card' },
+      el('div', { class: 'card-title' }, el('h2', { text: 'Dry-run report' }),
+        el('span', { class: 'badge badge-warning', text: 'needs your approval' }),
+        tip('Exactly what the runner would insert, and everything it noticed on the way. Nothing has been written. report.txt is the byte-identical twin of the CLI’s report, with the deal-by-deal listing.')));
+    rc.append(el('p', { class: 'muted small', style: 'margin-bottom:10px', text: 'Read the summary below, download report.txt for the full deal-by-deal listing, then approve or abort. Approval starts the insert immediately.' }));
+    rc.append(importReportLink(reportUrl, reportStatus, purgedAt));
+    rc.append(report ? importRenderReport(report) : el('p', { class: 'msg msg-err', text: 'The structured report has not been written yet. Refresh in a moment.' }));
+    root.append(rc);
+  }
+
+  // -- results --
+  if (job.status === 'done') root.append(importResultsCard(job, report, email, reportUrl, reportStatus, purgedAt));
+
+  // -- the report, for the states where it exists but is not the headline --
+  if (report && job.status !== 'awaiting_review' && job.status !== 'done') {
+    root.append(el('div', { class: 'card' },
+      el('div', { class: 'card-title' }, el('h2', { text: job.status === 'approved' || job.status === 'inserting' ? 'Approved dry-run report' : 'Dry-run report' })),
+      importReportLink(reportUrl, reportStatus, purgedAt),
+      importExpandable('Report sections', 1, () => importRenderReport(report), { plain: 'The report as it stood when the runner wrote it.', countText: 'expand' })));
+  }
+
+  // -- actions --
+  root.append(importActionsCard(job, email, purgedAt));
+  return root;
+}
+
+function importReportLink(url, status, purgedAt) {
+  if (url) {
+    return el('div', { class: 'btn-row', style: 'margin-bottom:12px' },
+      el('a', { class: 'btn btn-small', href: url, target: '_blank', rel: 'noopener' }, '⬇ report.txt'),
+      el('span', { class: 'muted small', text: 'Signed link, valid for one hour. Same text the CLI prints, bar the run-directory line.' }));
+  }
+  if (status === 'missing' || purgedAt) {
+    return el('p', { class: 'muted small', style: 'margin-bottom:12px', text: 'report.txt is gone from storage' + (purgedAt ? ' (files purged ' + relTime(purgedAt) + ')' : '') + '. The summary below is kept on the job itself.' });
+  }
+  if (status === 'sign_failed') {
+    return el('p', { class: 'msg msg-err', style: 'margin-bottom:12px', text: 'Could not sign a download link for report.txt right now. Refresh to retry.' });
+  }
+  return null;
+}
+
+// ---- questions ------------------------------------------------------------------
+function importCtxVal(key, v, parentKey) {
+  if (v === null || v === undefined) return '∅';
+  if (Array.isArray(v)) return v.length ? v.map(String).join(', ') : '(none)';
+  if (typeof v === 'object') return Object.entries(v).map(([k, vv]) => k + ' ' + importCtxVal(k, vv, key)).join(' · ');
+  if (typeof v === 'number' && /volume|price|amount/.test(key + ' ' + (parentKey || ''))) return money(v);
+  if (typeof v === 'boolean') return v ? 'yes' : 'no';
+  return String(v);
+}
+
+function importQuestionContext(ctx) {
+  const entries = Object.entries(ctx || {}).filter(([k]) => k !== 'key');
+  if (!entries.length) return null;
+  return el('div', { class: 'q-ctx' }, entries.map(([k, v]) =>
+    el('span', {}, el('b', { text: humanize(k) + ': ' }), importCtxVal(k, v))));
+}
+
+function importOpenQuestion(q, d) {
+  const pl = q.payload || {};
+  const card = el('div', { class: 'q-card q-open' });
+  card.append(el('div', { class: 'row', style: 'gap:8px;margin-bottom:6px' },
+    el('span', { class: 'badge badge-warning', text: importKindLabel(q.kind) }),
+    el('span', { class: 'muted small' }, 'asked ', relTimeEl(q.asked_at)),
+    el('span', { class: 'mono-sm', text: '#' + q.id })));
+  if (pl.title) card.append(el('p', { class: 'q-title', text: String(pl.title) }));
+  if (pl.reason) card.append(el('p', { class: 'msg msg-err', style: 'margin:0 0 8px', text: String(pl.reason) }));
+  if (Array.isArray(pl.details) && pl.details.length) card.append(el('ul', { class: 'q-details' }, pl.details.map((t) => el('li', { text: String(t) }))));
+  const ctx = importQuestionContext(pl.context);
+  if (ctx) card.append(ctx);
+  if (Array.isArray(pl.instructions) && pl.instructions.length) {
+    card.append(el('ol', { class: 'q-details' }, pl.instructions.map((t) => el('li', { text: String(t) }))));
+  }
+  if (pl.attempt) card.append(el('p', { class: 'muted small', style: 'margin-bottom:8px', text: 'Attempt ' + pl.attempt + ' of 3.' }));
+  if (pl.question) card.append(el('p', { class: 'q-question', text: String(pl.question) }));
+
+  const msg = el('p', { class: 'msg' });
+  if (d.msgs[q.id]) setMsg(msg, 'err', d.msgs[q.id]);
+  const options = Array.isArray(q.options) ? q.options.filter((o) => o && typeof o.key === 'string') : [];
+  if (options.length) {
+    const group = el('div', { class: 'opt-group' });
+    const buttons = [];
+    for (const o of options) {
+      const isAbort = o.key === 'abort';
+      const b = el('button', { class: 'btn opt-btn' + (isAbort ? ' btn-danger-outline' : '') }, String(o.label || o.key));
+      b.addEventListener('click', () => {
+        if (!isAbort) { importSendAnswer(q, o.key, msg, buttons); return; }
+        confirmModal({
+          title: 'Abort the run at this question?',
+          danger: true,
+          confirmLabel: 'Abort the run',
+          body: 'The runner stops here and the job ends as aborted. Nothing has been written. To try again you create a new import; every other answer you gave on this job is not reused.',
+          onConfirm: () => importSendAnswer(q, o.key, msg, buttons),
+        });
+      });
+      buttons.push(b);
+      group.append(b);
+    }
+    card.append(group);
+  } else {
+    // Free text (today: the cookie paste). Guarded: never prefilled from the
+    // row, kept only in memory until sent, and the row's answer is scrubbed
+    // by the runner and redacted by admin-api, so nothing ever echoes back.
+    const isCookie = q.kind === 'cookie';
+    const ta = el('textarea', { rows: '5', style: 'width:100%', class: 'edit-area', autocomplete: 'off', spellcheck: 'false',
+      placeholder: isCookie ? 'Paste the whole “Copy as cURL” command (or the raw Cookie header value) here' : 'Type the answer' });
+    ta.value = d.drafts[q.id] || '';
+    ta.addEventListener('input', () => { d.drafts[q.id] = ta.value; });
+    const send = el('button', { class: 'btn btn-primary btn-small' }, isCookie ? 'Send cookie to the runner' : 'Send answer');
+    send.addEventListener('click', () => {
+      const text = ta.value.trim();
+      if (!text) { setMsg(msg, 'err', isCookie ? 'Paste the cURL command first.' : 'Type an answer first.'); return; }
+      importSendAnswer(q, ta.value, msg, [send, ta]);
+    });
+    card.append(ta, el('div', { class: 'btn-row' }, send,
+      isCookie ? el('span', { class: 'muted small', text: 'A live credential for your dashboard login. The runner reads it once and scrubs it from the database; this panel never shows it again.' }) : null));
+  }
+  card.append(msg);
+  return card;
+}
+
+async function importSendAnswer(q, answer, msgEl, controls) {
+  const d = IMP.detail;
+  for (const c of controls) c.disabled = true;
+  setMsg(msgEl, 'info', 'Sending…');
+  try {
+    await adminApi('answer_import_question', { question_id: q.id, answer });
+    if (d) { delete d.drafts[q.id]; delete d.msgs[q.id]; }
+    toast('ok', 'Answer sent. The runner picks it up within about 10 seconds.');
+    await importRefreshDetail();
+  } catch (e) {
+    if (e.handled) return;
+    const text = e.code === 'already_answered' ? 'Already answered, by another admin or a moment ago. Refreshing.'
+      : e.code === 'invalid_answer' ? 'Not accepted: ' + e.message
+        : e.code === 'job_terminal' ? e.message + ' Refreshing.'
+          : e.code === 'question_not_found' ? 'This question no longer exists (the runner restarted and re-asks). Refreshing.'
+            : e.message;
+    if (d) d.msgs[q.id] = text;
+    setMsg(msgEl, 'err', text);
+    for (const c of controls) c.disabled = false;
+    if (['already_answered', 'job_terminal', 'question_not_found'].includes(e.code)) importRefreshDetail();
+  }
+}
+
+function importAnswerLabel(q) {
+  if (q.kind === 'cookie') return 'Session cookie supplied (consumed by the runner, never shown)';
+  const a = q.answer;
+  if (Array.isArray(q.options)) {
+    const o = q.options.find((x) => x && x.key === a);
+    if (o) return String(o.label || o.key);
+  }
+  if (a && typeof a === 'object') return a.redacted || a.consumed ? '(consumed, not shown)' : truncate(JSON.stringify(a), 200);
+  return truncate(String(a), 200);
+}
+
+function importAnsweredQuestion(q) {
+  const pl = q.payload || {};
+  return el('div', { class: 'q-card q-answered' },
+    el('div', { class: 'row', style: 'gap:8px;margin-bottom:4px' },
+      el('span', { class: 'badge badge-neutral', text: importKindLabel(q.kind) }),
+      el('span', { class: 'mono-sm', text: '#' + q.id })),
+    pl.title ? el('p', { class: 'small', text: String(pl.title) }) : null,
+    el('p', { class: 'small' }, el('b', { text: 'Answer: ' }), importAnswerLabel(q)),
+    el('p', { class: 'muted small' }, 'by ' + (q.answered_by_email || '—') + ' · ', relTimeEl(q.answered_at)));
+}
+
+// ---- report rendering (the jsonb from buildReportData) ------------------------------
+function importExpandable(title, count, buildBody, opts = {}) {
+  const clean = !count;
+  const head = el('button', { class: 'check-head', type: 'button' },
+    opts.badge || null,
+    el('span', { class: 'strong', text: title }),
+    el('span', { class: 'muted', text: clean ? 'none' : (opts.countText !== undefined ? opts.countText : intFmt(count) + (opts.unit ? ' ' + opts.unit : '')) }),
+    el('span', { class: 'grow' }),
+    el('span', { class: 'muted', text: clean ? '' : '▾' }));
+  const body = el('div', { class: 'check-body hidden' });
+  if (opts.plain) body.append(el('p', { class: 'check-plain', text: opts.plain }));
+  let built = false;
+  head.addEventListener('click', () => {
+    if (clean) return;
+    if (!built) { body.append(buildBody()); built = true; }
+    body.classList.toggle('hidden');
+  });
+  if (clean) head.style.opacity = '0.6';
+  return el('div', { class: 'check-card' }, head, body);
+}
+
+// rows: plain objects · cols: [{key, label, cls?, fmt?}]
+function importObjTable(rows, cols) {
+  const fmt = (c, v) => {
+    if (c.fmt) return c.fmt(v);
+    if (v === null || v === undefined) return '—';
+    if (typeof v === 'boolean') return v ? 'Yes' : 'No';
+    if (Array.isArray(v)) return v.length ? v.map((x) => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(', ') : '—';
+    if (typeof v === 'object') return truncate(JSON.stringify(v), 120);
+    if (typeof v === 'number' && /volume|price|amount|commission|total|fold_in/.test(c.key)) return money(v);
+    if (/date/.test(c.key) && typeof v === 'string') return fmtISODate(v);
+    return String(v);
+  };
+  return buildTable(cols.map((c) => ({ label: c.label, cls: c.cls || null })),
+    rows.map((r) => ({ cells: cols.map((c) => fmt(c, r[c.key])) })));
+}
+
+function importKV(label, value) {
+  return el('div', { class: 'agg-item' }, el('dt', { text: label }), el('dd', {}, value == null ? '—' : value));
+}
+
+function importRenderReport(r) {
+  const root = el('div', { class: 'stack' });
+  const counts = r.counts || {};
+  const totals = r.totals || {};
+  const dt = r.deal_type || {};
+  const pend = r.penders || {};
+
+  // 1. candidates: what would be inserted
+  const cand = el('div', {});
+  cand.append(el('h3', { style: 'margin-bottom:8px' }, 'Candidates ', tip('Every deal the runner would insert, by money state. The structured report carries counts and totals; the deal-by-deal rows are in report.txt.')));
+  cand.append(el('div', { class: 'stat-grid' },
+    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Total deals' }), el('div', { class: 'stat-value', text: intFmt(counts.total) })),
+    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Earned' }), el('div', { class: 'stat-value', text: intFmt(counts.earned) }),
+      el('div', { class: 'stat-delta', text: money(totals.earned && totals.earned.volume) + ' volume · ' + money(totals.earned && totals.earned.commission) + ' commission' })),
+    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Pending' }), el('div', { class: 'stat-value', text: intFmt(counts.pending) }),
+      el('div', { class: 'stat-delta', text: money(totals.pending && totals.pending.volume) + ' volume · ' + money(totals.pending && totals.pending.commission) + ' commission' })),
+    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Cancelled' }), el('div', { class: 'stat-value', text: intFmt(counts.cancelled) }),
+      el('div', { class: 'stat-delta', text: intFmt(counts.cancelled_rescission) + ' rescission · ' + intFmt(counts.cancelled_unpaid) + ' unpaid pender · ' + money(totals.cancelled && totals.cancelled.volume) + ' volume' }))));
+  cand.append(el('dl', { class: 'agg-grid' },
+    importKV('Deal type', intFmt(dt.new) + ' new · ' + intFmt(dt.upgrade) + ' upgrade'),
+    importKV('VOA rate applied', intFmt(r.voa_rate_applied)),
+    importKV('Penders', intFmt(pend.total) + ' total · ' + intFmt(pend.came_good) + ' came good · ' + intFmt(pend.unpaid) + ' unpaid · ' + intFmt(pend.with_schedule) + ' with schedule'),
+    importKV('Bad-trade reclass', intFmt(r.bad_trade_reclass && r.bad_trade_reclass.count) + ' deal(s) · ' + money(r.bad_trade_reclass && r.bad_trade_reclass.commission_moved) + ' moved'),
+    importKV('Reference date', r.reference_date ? fmtISODate(r.reference_date) : '—'),
+    importKV('Generated', r.generated_at ? fmtDateTime(r.generated_at) : '—')));
+  if (Array.isArray(r.market_source) && r.market_source.length) {
+    cand.append(el('p', { class: 'muted small', style: 'margin-top:8px', text: 'Market sources: ' + r.market_source.map((m) => m.source + ' ' + intFmt(m.count)).join(' · ') }));
+  }
+  if (r.employee_guard && r.employee_guard.status) {
+    const g = r.employee_guard;
+    cand.append(el('p', { class: g.status === 'match' ? 'muted small' : 'msg msg-err', style: 'margin-top:6px',
+      text: 'Employee guard: ' + g.status + ' (PDF rep ' + (g.salesPerson || '?') + ', commission report rep ' + (g.employeeNumber || '?') + ').' }));
+  }
+  root.append(cand);
+
+  // 2. contract
+  const con = r.contract;
+  const conWrap = el('div', {});
+  conWrap.append(el('h3', { style: 'margin-bottom:8px' }, 'Data-model contract ',
+    tip('Every candidate row checked against the app’s field-pair rules before insert. A violation blocks the import; a flag is surfaced but never blocks.')));
+  if (!con) {
+    conWrap.append(el('p', { class: 'muted small', text: 'No contract result in this report.' }));
+  } else {
+    conWrap.append(el('p', { class: con.ok ? 'msg msg-ok' : 'msg msg-err', style: 'margin:0 0 8px',
+      text: (con.ok ? 'PASS' : 'FAIL') + ': ' + intFmt(con.total) + ' row(s) checked · ' + intFmt((con.violations || []).length) + ' violation(s) · ' + intFmt((con.flags || []).length) + ' flag(s)' }));
+    conWrap.append(importExpandable('Violations (block the import)', (con.violations || []).length, () =>
+      importObjTable(con.violations, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'message', label: 'Message' }]),
+      { badge: (con.violations || []).length ? severityBadge('error') : null }));
+    conWrap.append(importExpandable('Flags (review, never block)', (con.flags || []).length, () =>
+      importObjTable(con.flags, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'message', label: 'Message' }]),
+      { badge: (con.flags || []).length ? severityBadge('warn') : null }));
+    conWrap.append(importExpandable('Rules', (con.by_rule || []).length, () =>
+      importObjTable(con.by_rule, [{ key: 'name', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'severity', label: 'Severity' }, { key: 'pass', label: 'Pass', cls: 'num' }, { key: 'fail', label: 'Fail', cls: 'num' }]),
+      { unit: 'rules' }));
+  }
+  root.append(conWrap);
+
+  // 3. commission merge
+  const cm = r.commission;
+  const cmWrap = el('div', {});
+  cmWrap.append(el('h3', { style: 'margin-bottom:8px' }, 'Commission report ',
+    tip('Only with a commission report PDF: its paid lines are matched to the candidate deals by account. IMPORT lines override the computed commission; the rest stay computed and are listed for review.')));
+  if (!cm) {
+    cmWrap.append(el('p', { class: 'muted small', text: 'No commission report on this import: every commission is computed from the rate rules.' }));
+  } else {
+    const parse = cm.parse || {};
+    const m = cm.matching || {};
+    const imp = cm.imported || {};
+    const left = cm.left_computed || {};
+    const xc = cm.cross_checks || {};
+    cmWrap.append(el('dl', { class: 'agg-grid', style: 'margin-bottom:8px' },
+      importKV('Employee', cm.employee == null ? '—' : String(cm.employee)),
+      importKV('Parse', intFmt(parse.data_lines) + ' lines · ' + intFmt(parse.accounts) + ' accounts · ' + intFmt(parse.voa_excluded) + ' VOA excluded'),
+      importKV('Self-validation', parse.self_validation_pass ? 'PASS (' + money(parse.sum_amounts) + ' = grand total)' : 'FAIL (' + money(parse.sum_amounts) + ' vs ' + money(parse.grand_total) + ')'),
+      importKV('Matching', intFmt(m.deals) + ' deals · ' + intFmt(m.matched) + ' matched · ' + intFmt(m.missing_from_report) + ' missing from report · ' + intFmt(m.report_only) + ' report only'),
+      importKV('Imported (paid overrides)', intFmt(imp.count) + ' · ' + money(imp.total)),
+      importKV('Left computed', intFmt(left.skip_notpaid) + ' not paid · ' + intFmt(left.skip_pending) + ' pending · ' + intFmt(left.zero_rate) + ' zero rate · ' + intFmt(left.missing_from_report) + ' missing')));
+    if (cm.buckets && typeof cm.buckets === 'object') {
+      cmWrap.append(el('p', { class: 'muted small', style: 'margin-bottom:8px', text: 'Report buckets: ' + Object.entries(cm.buckets).map(([k, v]) => k + ' ' + intFmt(v)).join(' · ') }));
+    }
+    const impCols = [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' },
+      { key: 'computed_rate', label: 'Computed rate', cls: 'num' }, { key: 'imported_rate', label: 'Paid rate', cls: 'num' },
+      { key: 'computed_amount', label: 'Computed', cls: 'num' }, { key: 'imported_amount', label: 'Paid', cls: 'num' }, { key: 'flags', label: 'Flags' }];
+    cmWrap.append(importExpandable('Paid overrides (IMPORT bucket)', (imp.rows || []).length, () => importObjTable(imp.rows, impCols),
+      { plain: 'Deals whose commission the report’s paid figure replaces. Flags mark a rate or amount that disagrees with the computed one.' }));
+    cmWrap.append(importExpandable('Unmatched commission rows (report only)', (cm.report_only || []).length, () =>
+      importObjTable(cm.report_only, [{ key: 'account', label: 'Account' }, { key: 'bucket', label: 'Bucket' }, { key: 'status', label: 'Status' }, { key: 'amount', label: 'Amount', cls: 'num' },
+        { key: 'split_shell', label: 'Split-shell suggestion', fmt: (s) => s ? 'shell of ' + s.of_account + ': owner ' + money(s.owner_commission) + ' + this = ' + money(s.suggested_fold_in) : '—' }]),
+      { plain: 'Paid lines with no candidate deal behind them. A split-shell suggestion means the account is a $0 sibling of another deal and its amount probably folds into that owner.' }));
+    cmWrap.append(importExpandable('Chargeback review', (cm.chargeback_review || []).length, () =>
+      importObjTable(cm.chargeback_review, [{ key: 'account', label: 'Account' }, { key: 'suggested_amount', label: 'Suggested', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' },
+        { key: 'cancelled', label: 'Cancelled' }, { key: 'cancel_reason', label: 'Reason' }, { key: 'lines', label: 'Lines', fmt: (l) => Array.isArray(l) ? intFmt(l.length) + ' line(s)' : '—' }]),
+      { plain: 'Accounts the report shows as charged back. The runner does not apply these; review them by hand.' }));
+    cmWrap.append(importExpandable('Arbitrated', (cm.arbitrated || []).length, () =>
+      importObjTable(cm.arbitrated, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Status' }, { key: 'gap', label: 'Gap (days)', cls: 'num' }, { key: 'bucket', label: 'Bucket' }, { key: 'would_have_been', label: 'Would have been' }, { key: 'new_state', label: 'New state' }]),
+      { plain: 'Deals where the report’s paid truth overruled the PDF classification.' }));
+    const xcDefs = [
+      ['import_but_cancelled', 'Paid but cancelled', [{ key: 'account', label: 'Account' }, { key: 'report_amount', label: 'Report amount', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'cancel_reason', label: 'Cancel reason' }]],
+      ['skip_notpaid_earned', 'Not paid but earned', [{ key: 'account', label: 'Account' }, { key: 'computed_amount', label: 'Computed', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }]],
+      ['volume_mismatch', 'Volume mismatch', [{ key: 'account', label: 'Account' }, { key: 'report_volume', label: 'Report volume', cls: 'num' }, { key: 'deal_volume', label: 'Deal volume', cls: 'num' }]],
+      ['existing_owner_rate', 'Existing-owner rate', [{ key: 'account', label: 'Account' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'existing_owner', label: 'Existing owner' }, { key: 'deal_date', label: 'Deal date' }]],
+    ];
+    for (const [key, label, cols] of xcDefs) {
+      const rows = Array.isArray(xc[key]) ? xc[key] : [];
+      cmWrap.append(importExpandable('Cross-check: ' + label, rows.length, () => importObjTable(rows, cols)));
+    }
+    if (xc.existing_owner_pre_era_skipped) {
+      cmWrap.append(el('p', { class: 'muted small', style: 'margin-top:6px', text: intFmt(xc.existing_owner_pre_era_skipped) + ' existing-owner rate check(s) skipped as pre-era.' }));
+    }
+  }
+  root.append(cmWrap);
+
+  // 4. everything else the runner noticed
+  const misc = el('div', {});
+  misc.append(el('h3', { style: 'margin-bottom:8px' }, 'Noticed on the way ',
+    tip('The lists the CLI prints after the candidates: accounts it could not scrape (enter those by hand after the import), dead never-paid contracts imported as tombstones, split groups, borderline cancels, and the decisions you made.')));
+  misc.append(importExpandable('Could not scrape (manual entry after import)', (r.could_not_scrape || []).length, () =>
+    importObjTable(r.could_not_scrape, [{ key: 'account', label: 'Account' }, { key: 'deal_date', label: 'Deal date' }, { key: 'owner', label: 'Owner' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'report_bucket', label: 'Report bucket' }, { key: 'report_amount', label: 'Report amount', cls: 'num' }]),
+    { plain: 'Accounts in the PDF that the dashboard no longer returns. They are not imported; enter them in the app by hand.' }));
+  misc.append(importExpandable('Unpaid tombstones', (r.tombstones || []).length, () =>
+    importObjTable(r.tombstones, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'deal_date', label: 'Deal date' }, { key: 'deal_type', label: 'Type' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'amount', label: 'Amount', cls: 'num' }, { key: 'cancel_reason', label: 'Cancel reason' }]),
+    { plain: 'Dead, never-paid contracts the dashboard no longer returns. They ARE imported, as $0 cancelled deals, so the book stays complete. Do not enter these by hand.' }));
+  misc.append(importExpandable('Split groups', (r.split_groups || []).length, () =>
+    importObjTable(r.split_groups, [{ key: 'accounts', label: 'Accounts' }, { key: 'asymmetry', label: 'Leg asymmetry' }]),
+    { plain: 'Accounts that share one sale split across contracts. Asymmetry means the legs disagree on volume.' }));
+  misc.append(importExpandable('Borderline cancels', (r.borderline || []).length, () =>
+    importObjTable(r.borderline, [{ key: 'account', label: 'Account' }, { key: 'gap', label: 'Gap (days)', cls: 'num' }, { key: 'payments', label: 'Payments', cls: 'num' }, { key: 'classified', label: 'Classified' }, { key: 'call', label: 'Call' }]),
+    { plain: 'Cancels near the bad-trade cutoff and how each was called.' }));
+  misc.append(importExpandable('Decisions you made', (r.decisions || []).length, () =>
+    importObjTable(r.decisions, [{ key: 'kind', label: 'Kind', fmt: (k) => importKindLabel(k) }, { key: 'key', label: 'Key' }, { key: 'answer', label: 'Answer' }]),
+    { plain: 'Every answered question folded into this run.' }));
+  misc.append(importExpandable('PDF-absent recoveries', (r.pdf_absent || []).length, () =>
+    importObjTable(r.pdf_absent, [{ key: 'account', label: 'Account' }, { key: 'provenance', label: 'Provenance' }]),
+    { plain: 'Deals the dashboard has that the PDF does not; recovered from dashboard data.' }));
+  misc.append(importExpandable('Targeted accounts excluded', (r.targeted_excluded || []).length, () =>
+    importObjTable(r.targeted_excluded, [{ key: 'account', label: 'Account' }, { key: 'reasons', label: 'Reasons' }, { key: 'probable_split_shell', label: 'Probable split shell' }])));
+  misc.append(importExpandable('Excluded type-D rows', (r.excluded_d || []).length, () =>
+    importObjTable(r.excluded_d, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'date', label: 'Date' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'sale', label: 'Sale' }, { key: 'money_bearing', label: 'Money bearing' }])));
+  misc.append(importExpandable('Sparse penders (no payment schedule)', (pend.sparse || []).length, () =>
+    importObjTable(pend.sparse, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Status' }])));
+  const san = r.sanity || {};
+  misc.append(importExpandable('Sanity: zero volume', (san.zero_volume || []).length, () => el('p', { class: 'mono-sm', text: (san.zero_volume || []).join(', ') })));
+  misc.append(importExpandable('Sanity: empty owners', (san.empty_owners || []).length, () => el('p', { class: 'mono-sm', text: (san.empty_owners || []).join(', ') })));
+  root.append(misc);
+
+  if (r.rules) {
+    root.append(el('p', { class: 'muted small', text: 'Rates used: new ' + pctFmt(r.rules.rate_new) + ' · upgrade ' + pctFmt(r.rules.rate_upgrade) + ' · VOA ' + pctFmt(r.rules.rate_voa) + ' · pender ' + pctFmt(r.rules.rate_pender) + ' · bad-trade cancel window ' + intFmt(r.rules.bad_trade_cancel_days) + ' days.' }));
+  }
+  return root;
+}
+
+// ---- results (done) --------------------------------------------------------------
+function importResultsCard(job, report, email, reportUrl, reportStatus, purgedAt) {
+  const card = el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'Results' }), el('span', { class: 'badge badge-success', text: 'done' }),
+      tip('What actually landed: the insert counts, the reconcile of every imported deal now on the account, the post-insert contract re-check, and the lists that need your hands: manual entries, unmatched commission rows, and review flags.')));
+  if (!report) {
+    card.append(el('p', { class: 'msg msg-err', text: 'The job is done but carries no report.' }));
+    return card;
+  }
+  if (report.nothing_to_import) {
+    card.append(el('div', { class: 'callout callout-info' }, el('div', { class: 'callout-body' },
+      el('strong', { text: 'Nothing to import' }),
+      'The account already had every requested deal (' + intFmt(report.already_present) + ' already present). Nothing was written.')));
+    card.append(importReportLink(reportUrl, reportStatus, purgedAt));
+    return card;
+  }
+  const ins = report.insert || {};
+  const rec = report.reconcile || {};
+  const pc = report.post_contract;
+  card.append(el('div', { class: 'stat-grid' },
+    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Inserted' }), el('div', { class: 'stat-value', text: intFmt(ins.inserted) }),
+      el('div', { class: 'stat-delta', text: 'of ' + intFmt(ins.attempted) + ' attempted · ' + intFmt(ins.already_present) + ' already present, skipped' })),
+    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Promised by the dry-run' }), el('div', { class: 'stat-value', text: intFmt(rec.promised) })),
+    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Imported deals on the account' }), el('div', { class: 'stat-value', text: intFmt(rec.imported_total) }),
+      el('div', { class: 'stat-delta', text: intFmt(rec.earned) + ' earned · ' + intFmt(rec.pending) + ' pending · ' + intFmt(rec.cancelled) + ' cancelled (' + intFmt(rec.cancelled_rescission) + ' rescission, ' + intFmt(rec.cancelled_unpaid) + ' unpaid)' })),
+    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Tombstoned' }), el('div', { class: 'stat-value', text: intFmt(rec.tombstoned) }),
+      el('div', { class: 'stat-delta', text: 'never-paid contracts imported as $0 cancels' }))));
+
+  // post-insert contract
+  if (pc && pc.ok === true) {
+    card.append(el('p', { class: 'msg msg-ok', style: 'margin:0 0 10px', text: 'Post-insert contract: PASS. ' + intFmt(pc.checked) + ' landed row(s) re-read and re-checked' + (pc.flags ? ' (' + intFmt(pc.flags) + ' non-blocking flag(s))' : '') + '.' }));
+  } else if (pc && pc.ok === false) {
+    card.append(el('div', { class: 'callout callout-danger' }, el('div', { class: 'callout-body' },
+      el('strong', { text: 'Post-insert contract FAILED: ' + intFmt((pc.violations || []).length) + ' violation(s) in rows already written' }),
+      'The data is on the account. Correct these rows by hand (open each deal from Users).',
+      importObjTable(pc.violations || [], [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'message', label: 'Message' }]))));
+  } else if (pc && pc.ok === null) {
+    card.append(el('p', { class: 'msg msg-err', style: 'margin:0 0 10px', text: 'Post-insert contract: could not verify what landed (' + (pc.error || 'read failed') + '). Run the integrity check on the user.' }));
+  } else if (!pc) {
+    card.append(el('p', { class: 'muted small', style: 'margin:0 0 10px', text: 'Post-insert contract: nothing to check (no rows in the plan).' }));
+  }
+
+  // manual-entry checklist
+  const manual = Array.isArray(rec.manual_entry) ? rec.manual_entry.map(String) : [];
+  const byAcct = new Map((report.could_not_scrape || []).map((x) => [String(x.account), x]));
+  const manualRows = manual.map((a) => Object.assign({ account: a }, byAcct.get(a) || {}));
+  card.append(importExpandable('Missing deals: enter these by hand', manualRows.length, () => {
+    const wrap = el('div', {});
+    wrap.append(buildTable(
+      [{ label: '' }, { label: 'Account' }, { label: 'Deal date' }, { label: 'Owner' }, { label: 'Volume', cls: 'num' }, { label: 'Report bucket' }, { label: 'Report amount', cls: 'num' }],
+      manualRows.map((m) => ({ cells: [el('input', { type: 'checkbox', title: 'Entered (this checkbox is only a reading aid; it is not saved)' }),
+        el('span', { class: 'mono-sm', text: m.account }), m.deal_date ? fmtISODate(m.deal_date) : '—', m.owner || '—', m.volume == null ? '—' : money(m.volume), m.report_bucket || '—', m.report_amount == null ? '—' : money(m.report_amount)] })),
+      { noCollapse: true }));
+    wrap.append(el('div', { class: 'btn-row' }, el('button', { class: 'btn btn-small', onclick: () =>
+      downloadBlob('manual-entry-' + String(email).replace(/[^a-z0-9.@-]+/gi, '_') + '.csv', 'text/csv', toCSV(manualRows.map((m) => ({ account: m.account, deal_date: m.deal_date || '', owner: m.owner || '', volume: m.volume == null ? '' : m.volume, report_bucket: m.report_bucket || '', report_amount: m.report_amount == null ? '' : m.report_amount })))) }, '⬇ CSV')));
+    return wrap;
+  }, { plain: 'Accounts from the PDF that the dashboard no longer returns, minus the ones imported as tombstones. They are not on the account: enter each one in the app by hand.',
+    badge: manualRows.length ? severityBadge('warn') : null }));
+
+  // unmatched commission rows + review flags
+  const cm = report.commission;
+  if (cm) {
+    card.append(importExpandable('Unmatched commission rows', (cm.report_only || []).length, () =>
+      importObjTable(cm.report_only, [{ key: 'account', label: 'Account' }, { key: 'bucket', label: 'Bucket' }, { key: 'status', label: 'Status' }, { key: 'amount', label: 'Amount', cls: 'num' },
+        { key: 'split_shell', label: 'Split-shell suggestion', fmt: (s) => s ? 'shell of ' + s.of_account + ': owner ' + money(s.owner_commission) + ' + this = ' + money(s.suggested_fold_in) : '—' }]),
+      { plain: 'Paid lines on the commission report with no imported deal behind them.' }));
+    const flagged = (cm.imported && Array.isArray(cm.imported.rows) ? cm.imported.rows : []).filter((x) => Array.isArray(x.flags) && x.flags.length);
+    card.append(importExpandable('Underpayment and rate flags', flagged.length, () =>
+      importObjTable(flagged, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'computed_rate', label: 'Computed rate', cls: 'num' }, { key: 'imported_rate', label: 'Paid rate', cls: 'num' },
+        { key: 'computed_amount', label: 'Computed', cls: 'num' }, { key: 'imported_amount', label: 'Paid', cls: 'num' }, { key: 'flags', label: 'Flags' }]),
+      { plain: 'Paid overrides whose rate or amount disagrees with the computed figure. The paid figure was imported; the flag is for you to chase.' }));
+    card.append(importExpandable('Chargeback review', (cm.chargeback_review || []).length, () =>
+      importObjTable(cm.chargeback_review, [{ key: 'account', label: 'Account' }, { key: 'suggested_amount', label: 'Suggested', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'cancelled', label: 'Cancelled' }, { key: 'cancel_reason', label: 'Reason' }])));
+    const xc = cm.cross_checks || {};
+    const xcCount = ['import_but_cancelled', 'skip_notpaid_earned', 'volume_mismatch', 'existing_owner_rate'].reduce((n, k) => n + (Array.isArray(xc[k]) ? xc[k].length : 0), 0);
+    card.append(importExpandable('Commission cross-checks', xcCount, () => el('div', {},
+      importObjTable(xc.import_but_cancelled || [], [{ key: 'account', label: 'Paid but cancelled' }, { key: 'report_amount', label: 'Report amount', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'cancel_reason', label: 'Reason' }]),
+      importObjTable(xc.skip_notpaid_earned || [], [{ key: 'account', label: 'Not paid but earned' }, { key: 'computed_amount', label: 'Computed', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }]),
+      importObjTable(xc.volume_mismatch || [], [{ key: 'account', label: 'Volume mismatch' }, { key: 'report_volume', label: 'Report volume', cls: 'num' }, { key: 'deal_volume', label: 'Deal volume', cls: 'num' }]),
+      importObjTable(xc.existing_owner_rate || [], [{ key: 'account', label: 'Existing-owner rate' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'existing_owner', label: 'Existing owner' }, { key: 'deal_date', label: 'Deal date' }]))));
+  }
+  const con = report.contract;
+  if (con) {
+    card.append(importExpandable('Dry-run contract flags', (con.flags || []).length, () =>
+      importObjTable(con.flags, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'message', label: 'Message' }])));
+  }
+  card.append(importExpandable('Sparse penders (no payment schedule)', ((report.penders || {}).sparse || []).length, () =>
+    importObjTable((report.penders || {}).sparse, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Status' }])));
+
+  card.append(el('div', { style: 'margin-top:12px' }, importReportLink(reportUrl, reportStatus, purgedAt)));
+  card.append(importExpandable('Dry-run report (as approved)', 1, () => importRenderReport(report), { plain: 'The full report the import was approved on.', countText: 'expand' }));
+  if (report.finished_at) card.append(el('p', { class: 'muted small', style: 'margin-top:8px', text: 'Finished ' + fmtDateTime(report.finished_at) + '.' }));
+  return card;
+}
+
+// ---- actions: approve / abort / purge ------------------------------------------------
+function importActionsCard(job, email, purgedAt) {
+  const card = el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'Actions' }),
+      tip('Approve is only offered on the dry-run. Abort is offered until approval; once approved the runner must finish. Purge removes a finished job’s files from storage and keeps the record.')));
+  const row = el('div', { class: 'btn-row' });
+  const p = job.progress || {};
+  const n = typeof p.counts === 'object' && p.counts && typeof p.counts.to_insert === 'number' ? p.counts.to_insert
+    : (job.report && job.report.counts && typeof job.report.counts.total === 'number' ? job.report.counts.total : null);
+
+  if (job.status === 'awaiting_review') {
+    const approve = el('button', { class: 'btn btn-primary' }, '✓ Approve import…');
+    approve.addEventListener('click', () => {
+      confirmModal({
+        title: 'Import ' + (n == null ? 'these deals' : intFmt(n) + ' deal(s)') + ' into ' + email + '?',
+        typed: 'IMPORT',
+        confirmLabel: 'Approve import',
+        body: el('div', {},
+          el('p', { text: 'This inserts ' + (n == null ? 'the deals in the report' : intFmt(n) + ' deal(s)') + ' into ' + email + '. The runner starts writing immediately. Once approved, the import cannot be aborted, and it cannot be undone from here: every inserted deal would have to be deleted by hand.' }),
+          el('p', { text: 'Dedupe is re-checked at write time, so deals already on the account are skipped, and the runner re-reads what landed against the data-model contract afterwards.' })),
+        onConfirm: async () => {
+          try {
+            await adminApi('approve_import_job', { job_id: job.id, confirm: 'IMPORT' });
+          } catch (e) {
+            if (e.code === 'not_awaiting_review') { importRefreshDetail(); throw new Error(e.message); }
+            throw e;
+          }
+          toast('ok', 'Approved. The runner is inserting into ' + email + '.');
+          importRefreshDetail();
+        },
+      });
+    });
+    row.append(approve);
+  }
+
+  if (IMPORT_ABORTABLE_STATUSES.includes(job.status)) {
+    const abort = el('button', { class: 'btn btn-danger-outline' }, '⏹ Abort…');
+    abort.addEventListener('click', () => {
+      const why = job.status === 'queued'
+        ? 'Removes the job from the queue before the runner picks it up. Nothing has been written.'
+        : job.status === 'awaiting_review'
+          ? 'Discards the dry-run without inserting anything. Nothing has been written.'
+          : 'The runner stops at its next check: within about 30 seconds, or at the next account boundary during a scrape. Nothing has been written.';
+      confirmModal({
+        title: 'Abort this import?',
+        danger: true,
+        confirmLabel: 'Abort import',
+        body: el('div', {},
+          el('p', { text: why }),
+          el('p', { text: 'The uploaded PDFs and any report stay in storage until you purge the job. To try again, create a new import.' })),
+        onConfirm: async () => {
+          try {
+            await adminApi('abort_import_job', { job_id: job.id });
+          } catch (e) {
+            if (e.code === 'not_abortable') { importRefreshDetail(); throw new Error(e.message); }
+            throw e;
+          }
+          toast('ok', 'Abort sent.');
+          importRefreshDetail();
+        },
+      });
+    });
+    row.append(abort);
+  } else if (job.status === 'approved' || job.status === 'inserting') {
+    row.append(el('span', { class: 'muted small', text: 'Approved imports cannot be aborted: the runner finishes the insert and reconciles what landed.' }));
+  }
+
+  if (IMPORT_TERMINAL_STATUSES.includes(job.status)) {
+    if (purgedAt) {
+      row.append(el('span', { class: 'muted small' }, 'Files purged ', relTimeEl(purgedAt), '.'));
+    } else {
+      const purge = el('button', { class: 'btn btn-danger-outline' }, '🗑 Purge files…');
+      purge.addEventListener('click', () => {
+        confirmModal({
+          title: 'Purge this job’s files?',
+          danger: true,
+          confirmLabel: 'Purge files',
+          body: el('div', {},
+            el('p', { text: 'Deletes this job’s files from storage: the uploaded PDFs, report.txt, and any runner checkpoint. The job record, its questions, and the summary on this screen stay.' }),
+            el('p', { text: 'This cannot be undone. Nothing on the target account is touched.' })),
+          onConfirm: async () => {
+            const resp = await adminApi('purge_import_job', { job_id: job.id });
+            toast('ok', 'Purged ' + intFmt(resp && resp.deleted) + ' file(s).');
+            importRefreshDetail();
+          },
+        });
+      });
+      row.append(purge);
+    }
+  }
+  if (!row.childNodes.length) row.append(el('span', { class: 'muted small', text: 'Nothing to do right now.' }));
+  card.append(row);
+  return card;
 }
 
 // ---------------------------------------------------------------------------
