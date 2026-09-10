@@ -2819,9 +2819,12 @@ function toolsImportDetail(routeJobId) {
       el('div', { class: 'card-title' }, el('h2', { text: 'Questions' }),
         open.length ? el('span', { class: 'badge badge-warning', text: intFmt(open.length) + ' open' }) : null,
         tip('Anything the runner refuses to guess: an unmapped division, an unrecognized cancel status, a PDF-vs-dashboard mismatch, or a dashboard session it needs from you. The run pauses until every open question is answered; answers are remembered even if the runner restarts.')));
+    const finished = IMPORT_TERMINAL_STATUSES.includes(job.status);
     if (open.length) {
-      qCard.append(el('p', { class: 'muted small', style: 'margin-bottom:10px', text: 'The runner is paused on these. Each answer is sent immediately and picked up within about 10 seconds.' }));
-      for (const q of open) qCard.append(importOpenQuestion(q, d));
+      qCard.append(el('p', { class: 'muted small', style: 'margin-bottom:10px', text: finished
+        ? 'These were still open when the job ' + job.status + '. They can no longer be answered here; a new import asks again (unless the mapping has been added to the tool since).'
+        : 'The runner is paused on these. Each answer is sent immediately and picked up within about 10 seconds.' }));
+      for (const q of open) qCard.append(importOpenQuestion(q, d, finished));
     } else if (IMPORT_LIVE_STATUSES.includes(job.status)) {
       qCard.append(el('p', { class: 'muted small', text: 'No open questions right now.' }));
     }
@@ -2892,9 +2895,9 @@ function importQuestionContext(ctx) {
     el('span', {}, el('b', { text: humanize(k) + ': ' }), importCtxVal(k, v))));
 }
 
-function importOpenQuestion(q, d) {
+function importOpenQuestion(q, d, readOnly) {
   const pl = q.payload || {};
-  const card = el('div', { class: 'q-card q-open' });
+  const card = el('div', { class: 'q-card ' + (readOnly ? 'q-answered' : 'q-open') });
   card.append(el('div', { class: 'row', style: 'gap:8px;margin-bottom:6px' },
     el('span', { class: 'badge badge-warning', text: importKindLabel(q.kind) }),
     el('span', { class: 'muted small' }, 'asked ', relTimeEl(q.asked_at)),
@@ -2913,6 +2916,13 @@ function importOpenQuestion(q, d) {
   const msg = el('p', { class: 'msg' });
   if (d.msgs[q.id]) setMsg(msg, 'err', d.msgs[q.id]);
   const options = Array.isArray(q.options) ? q.options.filter((o) => o && typeof o.key === 'string') : [];
+  if (readOnly) {
+    // A finished job: show the choices it offered, but nothing is sendable
+    // (admin-api answers job_terminal). No control, no draft.
+    if (options.length) card.append(el('p', { class: 'muted small', text: 'Choices offered: ' + options.map((o) => String(o.label || o.key)).join(' · ') }));
+    card.append(el('p', { class: 'muted small', text: 'Never answered: the job finished first.' }));
+    return card;
+  }
   if (options.length) {
     const group = el('div', { class: 'opt-group' });
     const buttons = [];
@@ -2968,7 +2978,7 @@ async function importSendAnswer(q, answer, msgEl, controls) {
     if (e.handled) return;
     const text = e.code === 'already_answered' ? 'Already answered, by another admin or a moment ago. Refreshing.'
       : e.code === 'invalid_answer' ? 'Not accepted: ' + e.message
-        : e.code === 'job_terminal' ? e.message + ' Refreshing.'
+        : e.code === 'job_terminal' ? e.message.replace(/\.?\s*$/, '.') + ' Refreshing.'
           : e.code === 'question_not_found' ? 'This question no longer exists (the runner restarted and re-asks). Refreshing.'
             : e.message;
     if (d) d.msgs[q.id] = text;
