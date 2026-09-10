@@ -2047,7 +2047,7 @@ function viewTools() {
   const base = state.route.name === 'deal' ? (state.baseRoute || state.route) : state.route;
   if (state.toolsTab === 'storage') wrap.append(toolsStorage());
   else if (state.toolsTab === 'data') wrap.append(toolsData());
-  else if (state.toolsTab === 'import') wrap.append(base.args[1] ? toolsImportDetail(base.args[1]) : toolsImport());
+  else if (state.toolsTab === 'import') wrap.append(base.args[1] === 'preview' ? toolsImportPreview() : base.args[1] ? toolsImportDetail(base.args[1]) : toolsImport());
   else wrap.append(toolsIntegrity());
   return wrap;
 }
@@ -2303,33 +2303,6 @@ const IMPORT_LIST_POLL_MS = 15000;
 const IMPORT_RUNNER_STALE_MS = 2 * 60 * 1000; // the runner heartbeats every 30 s
 const IMPORT_PHASES = ['claimed', 'download', 'validate', 'parse', 'dedupe', 'login', 'scrape', 'transform', 'report', 'review', 'insert', 'reconcile', 'done'];
 
-const IMPORT_KIND_LABELS = {
-  division: 'Market division', status: 'Cancel status', mismatch: 'PDF vs dashboard',
-  blocking: 'Cannot classify', penderLiveness: 'Pender liveness',
-  dashboardDealType: 'Deal type (dashboard)', dashboardPenderStatus: 'Pender status (dashboard)',
-  tradeEquity: 'Trade equity', tombstoneDealType: 'Tombstone deal type',
-  tombstoneCancelReason: 'Tombstone cancel reason', cookie: 'Dashboard session cookie',
-  scrapeIncomplete: 'Scrape incomplete', splitShellReview: 'Split shell review', unparsedRow: 'Unparsed listing row',
-  cancelledButPaid: 'Cancelled but paid',
-};
-
-// What to do next, per failure code the runner records (tool/import-rep.js
-// fail() codes + runner/index.js). Anything else gets the default line.
-const IMPORT_FAIL_ADVICE = {
-  contract_violation: 'Nothing was written. The refused rows are listed above; fix the cause (often an answer to a question, or a rule), then create a new import with the same PDFs.',
-  insert_failed: 'Some rows may have landed. Create a new import with the same PDFs: dedupe skips every deal already on the account, so nothing is duplicated.',
-  commission_parse_failed: 'Nothing was written. Re-export the commission report from Westgate and create a new import.',
-  pdf_parse_failed: 'Nothing was written. Re-export the all-deals PDF from Westgate and create a new import.',
-  pdf_missing: 'Nothing was written. The uploaded PDF could not be read on the runner. Upload it again in a new import.',
-  scrape_no_session: 'Nothing was written. The dashboard session could not be refreshed mid-scrape. Create a new import; the runner asks for a cookie here if the automatic login fails.',
-  no_session: 'Nothing was written. No dashboard session could be obtained after three cookie attempts. Check the runner’s Westgate credentials, then create a new import.',
-  target_user_missing: 'Nothing was written. The target account no longer exists.',
-  resume_checkpoint_missing: 'The runner restarted mid-insert and its saved insert plan was gone. Check what landed on the account before creating a new import.',
-  job_state_lost: 'The job row changed under the runner. Check the account, then create a new import if needed.',
-  runner_crash: 'The runner hit an unexpected error. Check its logs (fly logs -a dealtracker-import-runner), then create a new import.',
-  runner_bug: 'The runner hit an internal error. Check its logs (fly logs -a dealtracker-import-runner).',
-};
-const IMPORT_FAIL_DEFAULT = 'Nothing is written before approval. Check the runner logs (fly logs -a dealtracker-import-runner) and create a new import.';
 
 // Working state. Module-level so re-renders never lose a chosen file or a
 // half-typed answer; timers stop the moment the route leaves the tab.
@@ -2356,10 +2329,9 @@ function importStatusBadge(status) {
       : (status === 'awaiting_input' || status === 'awaiting_review') ? 'badge-warning'
         : (status === 'running' || status === 'approved' || status === 'inserting') ? 'badge-accent'
           : 'badge-neutral'; // queued, aborted; an unknown value renders as itself
-  return el('span', { class: 'badge ' + cls, text: humanize(status || '—') });
+  return el('span', { class: 'badge ' + cls, text: IMPORT_STATUS_WORDS[status] || humanize(status || '—') });
 }
 
-function importKindLabel(kind) { return IMPORT_KIND_LABELS[kind] || String(kind); }
 function importBasename(p) { return p ? String(p).split('/').pop() : '—'; }
 function importOnList() { return state.view === 'panel' && state.route.name === 'tools' && state.toolsTab === 'import' && !state.route.args[1]; }
 function importOnDetail(jobId) { return state.view === 'panel' && state.route.name === 'tools' && state.toolsTab === 'import' && state.route.args[1] === jobId; }
@@ -2474,6 +2446,7 @@ async function importDetailTick() {
 }
 
 function importOnRoute(jobId) {
+  if (jobId === 'preview') { importStopListPoll(); importStopDetailPoll(); IMP.detail = null; return; }
   if (C.users === null && !IMP.usersErr) {
     ensureUsers().then(() => rerender('tools')).catch((e) => { if (!e.handled) { IMP.usersErr = e.message; rerender('tools'); } });
   }
@@ -2546,18 +2519,18 @@ async function importCreateJob() {
   c.err = '';
   c.errJobId = null;
   const target = (C.users || []).find((u) => u.user_id === c.targetId);
-  if (!target) { c.err = 'Choose the target user first.'; rerender('tools'); return; }
-  if (!c.history) { c.err = 'Choose the all-deals history PDF. It is required.'; rerender('tools'); return; }
+  if (!target) { c.err = 'Choose the rep first.'; rerender('tools'); return; }
+  if (!c.history) { c.err = 'Choose the sales report PDF. It is required.'; rerender('tools'); return; }
   for (const f of [c.history, c.commission]) {
     if (f && !/\.pdf$/i.test(f.name)) { c.err = 'Only PDF files are accepted: “' + f.name + '” does not end in .pdf.'; rerender('tools'); return; }
   }
   if (c.commission && c.commission.name === c.history.name && c.commission.size === c.history.size) {
-    c.err = 'The commission report must be a different file from the history PDF.';
+    c.err = 'The commission report must be a different file from the sales report.';
     rerender('tools');
     return;
   }
   const targeted = importParseAccounts(c.accounts);
-  if (targeted.bad.length) { c.err = 'Targeted accounts must be 6 to 14 digits each. Not accepted: ' + targeted.bad.slice(0, 5).join(', ') + (targeted.bad.length > 5 ? '…' : ''); rerender('tools'); return; }
+  if (targeted.bad.length) { c.err = 'Account numbers are 6 to 14 digits each. Not accepted: ' + targeted.bad.slice(0, 5).join(', ') + (targeted.bad.length > 5 ? '…' : ''); rerender('tools'); return; }
   c.busy = true;
   c.uploads = {
     history: { pct: 0, status: 'Waiting', el: null },
@@ -2575,7 +2548,7 @@ async function importCreateJob() {
       params,
     });
     const job = resp && resp.job;
-    toast('ok', 'Import queued for ' + (target.email || target.user_id) + '. The runner picks it up within about 20 seconds.');
+    toast('ok', 'Import started for ' + importRepName(target.email) + '. It gets going within about 20 seconds.');
     IMP.create = importFreshCreate();
     IMP.jobs = null;
     if (job && job.id) nav('tools/import/' + job.id); else nav('tools/import');
@@ -2603,7 +2576,7 @@ async function importCreateJob() {
 function toolsImport() {
   const root = el('div', {});
   root.append(el('p', { class: 'muted small', style: 'margin-bottom:12px;max-width:70ch' },
-    'Bring a rep’s Westgate history into their account as a background job: upload the PDFs, answer the runner’s questions here, read the dry-run report, then approve. Nothing is written until you type IMPORT on that report.'));
+    'Bring a rep’s Westgate history into the app: upload the two PDFs, answer any questions here, read the report, then approve. Nothing is written until you approve.'));
   root.append(importCreateCard());
   root.append(importJobsCard());
   return root;
@@ -2613,15 +2586,15 @@ function importCreateCard() {
   const c = IMP.create;
   const card = el('div', { class: 'card' },
     el('div', { class: 'card-title' }, el('h2', { text: 'New import' }),
-      tip('The same pipeline as the operator CLI: parse the all-deals PDF, scrape each account on the Westgate dashboard, classify and price every deal, then stop for your approval. The runner on Fly.io does the work; this panel is only where you answer and approve.')));
+      tip('Reads the sales report, looks each deal up on the Westgate dashboard, sorts and prices every deal, then stops for your approval. A runner does the work; this panel is where you answer and approve.')));
 
   card.append(el('div', { class: 'callout callout-info', style: 'margin-bottom:14px' },
     el('div', { class: 'callout-body imp-intro' },
       el('strong', { text: 'What an import does' }),
-      'It reads the rep’s Westgate all-deals PDF, scrapes each account from the dashboard, classifies every deal (new or upgrade, pender or full down, earned, pending, or cancelled), prices the commission, and builds a dry-run report. Nothing is written to the account until you approve that report by typing IMPORT. Until then the job can be aborted at any time.',
+      'It reads the rep’s Westgate sales report, looks each deal up on the dashboard, sorts every deal (new or upgrade, financed or paid in full, earned, pending or cancelled), prices the commission, and builds a report for you. Nothing is written until you approve that report. Until then the import can be stopped at any time.',
       el('ol', {},
-        el('li', {}, el('b', { text: 'All-deals history PDF (required): ' }), 'the rep’s deal history export from the Westgate dashboard.'),
-        el('li', {}, el('b', { text: 'Commission report PDF (optional): ' }), 'the rep’s paid-commission report. With it, paid amounts override the computed ones and the report gains the commission cross-checks and the unmatched-rows list.')))));
+        el('li', {}, el('b', { text: 'Sales report PDF (required): ' }), 'the rep’s all-deals export from the Westgate dashboard.'),
+        el('li', {}, el('b', { text: 'Commission report PDF (optional): ' }), 'the rep’s paid-commission report. With it, every deal Westgate paid on carries the paid amount instead of an estimate.')))));
 
   // -- target user --
   const sel = el('select', { disabled: c.busy || C.users === null, style: 'min-width:260px;max-width:100%' });
@@ -2634,12 +2607,12 @@ function importCreateCard() {
   if (sel.value !== c.targetId) { c.targetId = ''; sel.value = ''; }
   sel.addEventListener('change', () => { c.targetId = sel.value; c.err = ''; c.errJobId = null; });
   card.append(el('div', { class: 'field', style: 'margin-bottom:12px' },
-    el('span', {}, el('span', { class: 'strong', text: 'Target user ' }), tip('The account the deals are inserted into after approval. One live import per user: a second one for the same account is refused until the first finishes or is aborted.')),
+    el('span', {}, el('span', { class: 'strong', text: 'Rep ' }), tip('Whose book the deals go into after approval. One import at a time per rep.')),
     sel,
     IMP.usersErr ? el('span', { class: 'msg msg-err', text: 'Could not load the roster: ' + IMP.usersErr }) : null));
 
   if (c.note) {
-    card.append(el('div', { class: 'callout callout-info', style: 'margin-bottom:12px' }, el('div', { class: 'callout-body' }, el('strong', { text: 'Targeted follow-up job' }), c.note)));
+    card.append(el('div', { class: 'callout callout-info', style: 'margin-bottom:12px' }, el('div', { class: 'callout-body' }, el('strong', { text: 'Targeted import' }), c.note)));
   }
 
   // -- file pickers --
@@ -2668,21 +2641,21 @@ function importCreateCard() {
     }
     return row;
   };
-  card.append(picker('history', 'All-deals history PDF',
-    'The Westgate dashboard’s deal-history export for this rep. Every account number in it is a candidate; the runner scrapes each one that is not already on the account.', true));
+  card.append(picker('history', 'Sales report PDF',
+    'The Westgate dashboard’s all-deals export for this rep. Every account in it is looked up on the dashboard unless the rep already has it.', true));
   card.append(picker('commission', 'Commission report PDF',
-    'The rep’s paid-commission report. Optional: without it every commission is computed from the rate rules; with it, paid amounts override the computed ones and the report gains the commission cross-checks.', false));
+    'The rep’s paid-commission report. Without it every commission is the standard-rate estimate; with it, every deal Westgate paid on carries the paid amount.', false));
 
   // -- targeted accounts (optional) --
   const acctIn = el('textarea', { rows: '2', style: 'width:100%', class: 'edit-area', placeholder: 'Account numbers, separated by commas or new lines (optional)', disabled: c.busy });
   acctIn.value = c.accounts || '';
   acctIn.addEventListener('input', () => { c.accounts = acctIn.value; c.err = ''; });
   card.append(el('div', { class: 'field', style: 'margin:10px 0 12px' },
-    el('span', {}, el('span', { class: 'strong', text: 'Targeted accounts (optional) ' }), tip('Leave empty for a normal import of everything in the all-deals PDF. List account numbers to import ONLY those: the case for deals the commission report paid but the all-deals report does not list (the review and results screens name them under "absent from the all-deals report"). The PDF stays required; a listed account with no PDF row is recovered from the dashboard alone, and its inferences are shown for review.')),
+    el('span', {}, el('span', { class: 'strong', text: 'Only these accounts (optional) ' }), tip('Leave empty to import everything in the sales report. List account numbers to import only those: the case for deals Westgate paid on that the sales report does not list. The sales report is still required; a listed account it does not carry is taken from the dashboard alone.')),
     acctIn));
 
   // -- submit + inline errors --
-  const go = el('button', { class: 'btn btn-primary', disabled: c.busy || !c.history || !c.targetId }, c.busy ? 'Uploading…' : '⬆ Upload and queue import');
+  const go = el('button', { class: 'btn btn-primary', disabled: c.busy || !c.history || !c.targetId }, c.busy ? 'Uploading…' : '⬆ Upload and start the import');
   go.addEventListener('click', importCreateJob);
   const msg = el('p', { class: 'msg' });
   if (c.err) {
@@ -2690,26 +2663,25 @@ function importCreateCard() {
     if (c.errJobId) msg.append(' ', el('button', { class: 'btn-link', onclick: () => nav('tools/import/' + c.errJobId) }, 'Open the active job'));
   }
   card.append(el('div', { class: 'btn-row', style: 'margin-top:12px' }, go,
-    el('span', { class: 'muted small', text: 'Upload first, then the job is queued. The runner claims it within about 20 seconds.' })), msg);
+    el('span', { class: 'muted small', text: 'The import starts within about 20 seconds of the upload.' })), msg);
   return card;
 }
 
 function importJobsCard() {
   const card = el('div', { class: 'card' },
-    el('div', { class: 'card-title' }, el('h2', { text: 'Import jobs' }),
-      tip('Every import ever queued, newest first. Amber means the job is waiting on you (a question or the review). Click a row to open it.'),
+    el('div', { class: 'card-title' }, el('h2', { text: 'Imports' }),
+      tip('Every import, newest first. Amber means it is waiting on you. Click a row to open it.'),
       el('span', { class: 'grow' }),
       el('button', { class: 'btn btn-small', onclick: () => loadImportJobs(true) }, '↻ Refresh')));
   if (IMP.jobsErr) card.append(el('p', { class: 'msg msg-err', text: IMP.jobsErr }));
   if (IMP.jobs === null) { card.append(skeletonRows(4, 24)); return card; }
   if (!IMP.jobs.length) {
-    card.append(emptyState('No imports yet', 'Queue one above. Jobs appear here the moment they are created.'));
+    card.append(emptyState('No imports yet', 'Start one above.'));
     return card;
   }
   card.append(buildTable(
-    [{ label: 'Status', tip: 'queued: waiting for the runner · running: working · awaiting input: a question needs you · awaiting review: the dry-run needs your IMPORT · approved / inserting: writing · done, failed, aborted: finished.' },
-      { label: 'Target' }, { label: 'Created' },
-      { label: 'Questions', tip: 'Open questions the runner is blocked on. Answer them inside the job.' },
+    [{ label: 'Status' }, { label: 'Rep' }, { label: 'Started' },
+      { label: 'Questions', tip: 'Questions waiting for an answer. Open the import to answer them.' },
       { label: 'Progress' }],
     IMP.jobs.map((j) => {
       const p = j.progress || {};
@@ -2722,33 +2694,55 @@ function importJobsCard() {
             el('span', { class: 'cell-sub', text: 'by ' + (j.created_by_email || '—') })),
           relTimeEl(j.created_at),
           j.open_question_count > 0
-            ? el('span', { class: 'badge badge-warning', text: intFmt(j.open_question_count) + ' open' })
+            ? el('span', { class: 'badge badge-warning', text: intFmt(j.open_question_count) + ' waiting' })
             : el('span', { class: 'muted', text: '—' }),
           el('span', { class: 'params-cell', text: truncate(p.line || '—', 110), title: p.line || null }),
         ],
       };
     })));
   if (IMP.jobs.some((j) => IMPORT_LIVE_STATUSES.includes(j.status))) {
-    card.append(el('p', { class: 'muted small', style: 'margin-top:8px', text: 'Refreshes every 15 seconds while a job is live.' }));
+    card.append(el('p', { class: 'muted small', style: 'margin-top:8px', text: 'Refreshes every 15 seconds while an import is running.' }));
   }
   return card;
 }
 
 // ---- detail view -------------------------------------------------------------
+// Plain-English surfaces (overhaul, v15). Every word here is for someone who has
+// never seen the CLI, the SPEC or a terminal: the rep is named by first name,
+// Westgate by name, and no internal identifier (question kinds, bucket names,
+// rule ids, provenance values) reaches the screen. Those stay in report.txt.
+const IMPORT_STATUS_WORDS = {
+  queued: 'Queued', running: 'Working', awaiting_input: 'Needs an answer', awaiting_review: 'Needs your approval',
+  approved: 'Approved', inserting: 'Writing deals', done: 'Done', failed: 'Failed', aborted: 'Stopped',
+};
+const IMPORT_PHASE_WORDS = {
+  claimed: 'Picked up', download: 'Files', validate: 'Checks', parse: 'Reading the report', dedupe: 'Known deals',
+  login: 'Signing in', scrape: 'Reading the dashboard', transform: 'Sorting deals', report: 'Report', review: 'Your approval',
+  insert: 'Writing', reconcile: 'Checking', done: 'Done',
+};
+
+// The rep's first name, from the target email (the roster carries no name).
+function importRepName(email) {
+  const local = String(email || '').split('@')[0];
+  const first = local.split(/[._\-+]/).filter(Boolean)[0] || local;
+  const word = first.replace(/\d+/g, '');
+  return word ? word.charAt(0).toUpperCase() + word.slice(1).toLowerCase() : 'the rep';
+}
+
 function importHealth(job) {
   if (IMPORT_TERMINAL_STATUSES.includes(job.status)) {
-    return { cls: 'muted small', text: 'Finished ' + relTime(job.updated_at) + (job.runner_id ? ' · runner ' + job.runner_id : '') };
+    return { cls: 'muted small', text: 'Finished ' + relTime(job.updated_at) };
   }
   if (job.status === 'queued') {
-    return { cls: 'health-wait', text: 'Waiting for the runner to claim this job. It checks for new jobs every 20 seconds.' };
+    return { cls: 'health-wait', text: 'Waiting for the runner to pick this up (it checks every 20 seconds).' };
   }
   const hb = job.heartbeat_at ? Date.parse(job.heartbeat_at) : NaN;
-  if (isNaN(hb)) return { cls: 'health-bad', text: 'Runner offline. It never checked in on this job.' };
+  if (isNaN(hb)) return { cls: 'health-bad', text: 'Runner offline: it never checked in on this job.' };
   const age = Date.now() - hb;
   if (age > IMPORT_RUNNER_STALE_MS) {
-    return { cls: 'health-bad', text: 'Runner offline. Last seen ' + relTime(job.heartbeat_at) + '. The job resumes under the crash law when the runner comes back.' };
+    return { cls: 'health-bad', text: 'Runner offline. Last seen ' + relTime(job.heartbeat_at) + '. The job carries on when it is back.' };
   }
-  return { cls: 'health-ok', text: 'Runner online · checked in ' + relTime(job.heartbeat_at) + (job.runner_id ? ' · ' + job.runner_id : '') };
+  return { cls: 'health-ok', text: 'Runner online, checked in ' + relTime(job.heartbeat_at) };
 }
 
 function importPaintHealth(d) {
@@ -2770,11 +2764,11 @@ function importPhaseTrack(job) {
   const idx = IMPORT_PHASES.indexOf(cur);
   const track = el('div', { class: 'phase-track' });
   if (idx === -1) {
-    track.append(el('span', { class: 'phase-chip current', text: cur ? humanize(cur) : (job.status === 'queued' ? 'queued' : '—') }));
+    track.append(el('span', { class: 'phase-chip current', text: cur ? (IMPORT_PHASE_WORDS[cur] || humanize(cur)) : (job.status === 'queued' ? 'Queued' : '—') }));
     return track;
   }
   IMPORT_PHASES.forEach((ph, i) => {
-    track.append(el('span', { class: 'phase-chip' + (i < idx ? ' past' : i === idx ? ' current' : ''), text: ph }));
+    track.append(el('span', { class: 'phase-chip' + (i < idx ? ' past' : i === idx ? ' current' : ''), text: IMPORT_PHASE_WORDS[ph] || ph }));
   });
   return track;
 }
@@ -2792,267 +2786,101 @@ function toolsImportDetail(routeJobId) {
   }
   const { job, target_email: targetEmail, questions, report_text_url: reportUrl, report_text_status: reportStatus } = d.data;
   const email = targetEmail || job.target_user_id;
+  const rep = importRepName(targetEmail);
   const report = job.report && typeof job.report === 'object' ? job.report : null;
   const p = job.progress || {};
   const purgedAt = typeof p.purged_at === 'string' ? p.purged_at : null;
+  const screen = { rep, email, job, questions: questions || [], reportUrl, reportStatus, purgedAt };
 
   // -- header --
   const health = importHealth(job);
   d.healthEl = el('p', { class: 'imp-health ' + health.cls, text: health.text + (d.err ? ' · refresh failed: ' + d.err : '') });
   root.append(el('div', { class: 'card' },
-    el('div', { class: 'card-title' }, el('h2', { text: 'Import into ' + email }), importStatusBadge(job.status),
-      tip('One job, end to end: queued, running, awaiting input (a question), awaiting review (the dry-run), approved and inserting (writing), then done, failed, or aborted. This screen refreshes every 5 seconds while the job is live.')),
+    el('div', { class: 'card-title' }, el('h2', { text: 'Import for ' + rep }), importStatusBadge(job.status),
+      el('span', { class: 'muted small', text: email })),
     el('dl', { class: 'agg-grid', style: 'margin-bottom:12px' },
-      el('div', { class: 'agg-item' }, el('dt', { text: 'Created' }), el('dd', {}, relTimeEl(job.created_at))),
-      el('div', { class: 'agg-item' }, el('dt', { text: 'Created by' }), el('dd', { text: job.created_by_email || '—' })),
-      el('div', { class: 'agg-item' }, el('dt', { text: 'History PDF' }), el('dd', { text: importBasename(job.pdf_history_path), title: job.pdf_history_path })),
-      el('div', { class: 'agg-item' }, el('dt', { text: 'Commission report' }), el('dd', { text: job.pdf_commission_path ? importBasename(job.pdf_commission_path) : 'none', title: job.pdf_commission_path || null })),
-      el('div', { class: 'agg-item' }, el('dt', { text: 'Job id' }), el('dd', { class: 'mono-sm', text: truncate(job.id, 13), title: job.id })),
-      el('div', { class: 'agg-item' }, el('dt', { text: 'Runner' }), el('dd', { class: 'mono-sm', text: job.runner_id || 'not claimed yet' }))),
-    el('div', { class: 'row', style: 'gap:6px' }, d.healthEl,
-      tip('The runner stamps a heartbeat every 30 seconds while it owns the job, including while it waits on you. Offline means no heartbeat for over 2 minutes: the job is not lost, it resumes when the runner restarts.'))));
+      el('div', { class: 'agg-item' }, el('dt', { text: 'Started' }), el('dd', {}, relTimeEl(job.created_at))),
+      el('div', { class: 'agg-item' }, el('dt', { text: 'By' }), el('dd', { text: job.created_by_email || '—' })),
+      el('div', { class: 'agg-item' }, el('dt', { text: 'Sales report' }), el('dd', { text: importBasename(job.pdf_history_path), title: job.pdf_history_path })),
+      el('div', { class: 'agg-item' }, el('dt', { text: 'Commission report' }), el('dd', { text: job.pdf_commission_path ? importBasename(job.pdf_commission_path) : 'none uploaded', title: job.pdf_commission_path || null }))),
+    d.healthEl));
 
-  // -- progress --
-  root.append(el('div', { class: 'card' },
-    el('div', { class: 'card-title' }, el('h2', { text: 'Progress' }),
-      tip('The runner’s own phase and status line, written as it works (throttled to every few seconds). Counts are its tallies for the current phase, for example scraped accounts or inserted rows.')),
-    importPhaseTrack(job),
-    el('p', { class: 'imp-line', text: p.line || 'No status line yet.' }),
-    el('div', { class: 'row', style: 'gap:10px' }, importCountsChips(p.counts),
-      el('span', { class: 'muted small' }, 'updated ', relTimeEl(p.updated_at || job.updated_at)))));
+  // -- progress (only while the job is moving; a finished job shows its outcome instead) --
+  if (!IMPORT_TERMINAL_STATUSES.includes(job.status)) {
+    root.append(el('div', { class: 'card' },
+      el('div', { class: 'card-title' }, el('h2', { text: 'Progress' })),
+      importPhaseTrack(job),
+      el('p', { class: 'imp-line', text: p.line || 'Nothing to report yet.' }),
+      el('div', { class: 'row', style: 'gap:10px' }, importCountsChips(p.counts),
+        el('span', { class: 'muted small' }, 'updated ', relTimeEl(p.updated_at || job.updated_at)))));
+  }
 
-  // -- failure / abort --
-  if (job.status === 'failed') {
-    root.append(el('div', { class: 'callout callout-danger' },
-      el('div', { class: 'callout-body' },
-        el('strong', {}, 'Failed ', el('span', { class: 'badge badge-danger', text: job.error_code || 'unknown' })),
-        el('pre', { class: 'imp-detail-pre', text: job.error_detail || 'No detail recorded.' }),
-        importContractViolations(report),
-        el('p', { class: 'strong', style: 'margin-top:8px', text: 'What to do: ' + (IMPORT_FAIL_ADVICE[job.error_code] || IMPORT_FAIL_DEFAULT) }))));
-  } else if (job.status === 'aborted') {
+  // -- failed / stopped --
+  if (job.status === 'failed') root.append(importFailedCard(job, report, screen));
+  else if (job.status === 'aborted') {
     root.append(el('div', { class: 'callout callout-warning' },
       el('div', { class: 'callout-body' },
-        el('strong', {}, 'Aborted ', el('span', { class: 'badge badge-neutral', text: job.error_code || 'aborted' })),
-        el('p', { text: job.error_detail || 'Aborted.' }),
-        el('p', { class: 'strong', style: 'margin-top:8px', text: 'Nothing was written. To try again, create a new import with the same PDFs.' }))));
+        el('strong', { text: 'This import was stopped. Nothing was written to ' + rep + '’s book.' }),
+        el('p', { class: 'small', text: job.error_detail && /operator|panel|review|outlier|scrape/i.test(job.error_detail) ? 'Stopped from this panel.' : (job.error_detail || 'Stopped.') }),
+        el('p', { class: 'small', style: 'margin-top:6px', text: 'To try again, start a new import with the same PDFs.' }))));
   }
 
   // -- questions --
   const open = (questions || []).filter((q) => !q.answered_at);
   const answered = (questions || []).filter((q) => q.answered_at);
-  if (open.length || answered.length) {
-    const qCard = el('div', { class: 'card' },
-      el('div', { class: 'card-title' }, el('h2', { text: 'Questions' }),
-        open.length ? el('span', { class: 'badge badge-warning', text: intFmt(open.length) + ' open' }) : null,
-        tip('Anything the runner refuses to guess: an unmapped division, an unrecognized cancel status, a PDF-vs-dashboard mismatch, or a dashboard session it needs from you. The run pauses until every open question is answered; answers are remembered even if the runner restarts.')));
+  if (open.length || (answered.length && job.status !== 'awaiting_review' && job.status !== 'done')) {
     const finished = IMPORT_TERMINAL_STATUSES.includes(job.status);
+    const qCard = el('div', { class: 'card' },
+      el('div', { class: 'card-title' }, el('h2', { text: open.length ? (open.length === 1 ? 'One question for you' : intFmt(open.length) + ' questions for you') : 'Questions' }),
+        open.length && !finished ? el('span', { class: 'badge badge-warning', text: 'the import is paused' }) : null));
     if (open.length) {
-      qCard.append(el('p', { class: 'muted small', style: 'margin-bottom:10px', text: finished
-        ? 'These were still open when the job ' + job.status + '. They can no longer be answered here; a new import asks again (unless the mapping has been added to the tool since).'
-        : 'The runner is paused on these. Each answer is sent immediately and picked up within about 10 seconds.' }));
-      for (const q of open) qCard.append(importOpenQuestion(q, d, finished));
-    } else if (IMPORT_LIVE_STATUSES.includes(job.status)) {
-      qCard.append(el('p', { class: 'muted small', text: 'No open questions right now.' }));
+      if (finished) qCard.append(el('p', { class: 'muted small', style: 'margin-bottom:10px', text: 'Still open when the import ended. They cannot be answered now; a new import asks again.' }));
+      for (const q of open) qCard.append(importQuestionCard(q, d, finished, rep));
     }
     if (answered.length) {
-      qCard.append(el('div', { style: 'margin-top:12px' }, importExpandable('Answered', answered.length, () =>
-        el('div', {}, answered.map((q) => importAnsweredQuestion(q))), { plain: 'Every question already answered on this job, with who answered and when.' })));
+      qCard.append(el('div', { style: open.length ? 'margin-top:12px' : '' },
+        importExpandable('Answered', answered.length, () => el('div', { class: 'q-answers' }, answered.map((q) => importAnsweredQuestion(q, rep))))));
     }
     root.append(qCard);
   }
 
-  // -- review gate --
-  if (job.status === 'awaiting_review') {
-    const rc = el('div', { class: 'card' },
-      el('div', { class: 'card-title' }, el('h2', { text: 'Dry-run report' }),
-        el('span', { class: 'badge badge-warning', text: 'needs your approval' }),
-        tip('Exactly what the runner would insert, and everything it noticed on the way. Nothing has been written. report.txt is the byte-identical twin of the CLI’s report, with the deal-by-deal listing.')));
-    rc.append(el('p', { class: 'muted small', style: 'margin-bottom:10px', text: 'Read the summary below, download report.txt for the full deal-by-deal listing, then approve or abort. Approval starts the insert immediately.' }));
-    rc.append(importReportLink(reportUrl, reportStatus, purgedAt));
-    rc.append(report ? importRenderReport(report) : el('p', { class: 'msg msg-err', text: 'The structured report has not been written yet. Refresh in a moment.' }));
-    root.append(rc);
-  }
-
-  // -- results --
-  if (job.status === 'done') root.append(importResultsCard(job, report, email, reportUrl, reportStatus, purgedAt));
-
-  // -- the report, for the states where it exists but is not the headline --
+  // -- the review, the outcome, or the report for the in-between states --
+  if (job.status === 'awaiting_review') root.append(importReviewCard(report, screen));
+  if (job.status === 'done') root.append(importResultsCard(report, screen));
   if (report && job.status !== 'awaiting_review' && job.status !== 'done') {
     root.append(el('div', { class: 'card' },
-      el('div', { class: 'card-title' }, el('h2', { text: job.status === 'approved' || job.status === 'inserting' ? 'Approved dry-run report' : 'Dry-run report' })),
+      el('div', { class: 'card-title' }, el('h2', { text: job.status === 'failed' ? 'The report as it stood' : 'The approved report' })),
       importReportLink(reportUrl, reportStatus, purgedAt),
-      importExpandable('Report sections', 1, () => importRenderReport(report), { plain: 'The report as it stood when the runner wrote it.', countText: 'expand' })));
+      importExpandable('Report', 1, () => importRenderReport(report, screen), { countText: 'show' })));
   }
 
   // -- actions --
-  root.append(importActionsCard(job, email, purgedAt));
+  root.append(importActionsCard(job, screen));
   return root;
-}
-
-// The rows the data-model contract refused (report.contract.violations), for
-// the failed screen. Null when the report carries none.
-function importContractViolations(report) {
-  const v = report && report.contract && Array.isArray(report.contract.violations) ? report.contract.violations : [];
-  if (!v.length) return null;
-  return el('div', { style: 'margin-top:10px' },
-    el('p', { class: 'strong', text: intFmt(v.length) + ' contract violation(s), the rows the runner refused to insert:' }),
-    importObjTable(v, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'message', label: 'Message' }]));
 }
 
 function importReportLink(url, status, purgedAt) {
   if (url) {
     return el('div', { class: 'btn-row', style: 'margin-bottom:12px' },
-      el('a', { class: 'btn btn-small', href: url, target: '_blank', rel: 'noopener' }, '⬇ report.txt'),
-      el('span', { class: 'muted small', text: 'Signed link, valid for one hour. Same text the CLI prints, bar the run-directory line.' }));
+      el('a', { class: 'btn btn-small', href: url, target: '_blank', rel: 'noopener' }, '⬇ Full report (text file)'),
+      el('span', { class: 'muted small', text: 'Every deal, line by line. Link good for one hour.' }));
   }
   if (status === 'missing' || purgedAt) {
-    return el('p', { class: 'muted small', style: 'margin-bottom:12px', text: 'report.txt is gone from storage' + (purgedAt ? ' (files purged ' + relTime(purgedAt) + ')' : '') + '. The summary below is kept on the job itself.' });
+    return el('p', { class: 'muted small', style: 'margin-bottom:12px', text: 'The full text report is gone from storage' + (purgedAt ? ' (files purged ' + relTime(purgedAt) + ')' : '') + '. The summary below stays with the job.' });
   }
   if (status === 'sign_failed') {
-    return el('p', { class: 'msg msg-err', style: 'margin-bottom:12px', text: 'Could not sign a download link for report.txt right now. Refresh to retry.' });
+    return el('p', { class: 'msg msg-err', style: 'margin-bottom:12px', text: 'Could not make a download link right now. Refresh to retry.' });
   }
   return null;
 }
 
-// ---- questions ------------------------------------------------------------------
-function importCtxVal(key, v, parentKey) {
-  if (v === null || v === undefined) return '∅';
-  if (Array.isArray(v)) return v.length ? v.map(String).join(', ') : '(none)';
-  if (typeof v === 'object') return Object.entries(v).map(([k, vv]) => k + ' ' + importCtxVal(k, vv, key)).join(' · ');
-  if (typeof v === 'number' && /volume|price|amount/.test(key + ' ' + (parentKey || ''))) return money(v);
-  if (typeof v === 'boolean') return v ? 'yes' : 'no';
-  return String(v);
-}
-
-function importQuestionContext(ctx) {
-  const entries = Object.entries(ctx || {}).filter(([k]) => k !== 'key');
-  if (!entries.length) return null;
-  return el('div', { class: 'q-ctx' }, entries.map(([k, v]) =>
-    el('span', {}, el('b', { text: humanize(k) + ': ' }), importCtxVal(k, v))));
-}
-
-function importOpenQuestion(q, d, readOnly) {
-  const pl = q.payload || {};
-  const card = el('div', { class: 'q-card ' + (readOnly ? 'q-answered' : 'q-open') });
-  card.append(el('div', { class: 'row', style: 'gap:8px;margin-bottom:6px' },
-    el('span', { class: 'badge badge-warning', text: importKindLabel(q.kind) }),
-    el('span', { class: 'muted small' }, 'asked ', relTimeEl(q.asked_at)),
-    el('span', { class: 'mono-sm', text: '#' + q.id })));
-  if (pl.title) card.append(el('p', { class: 'q-title', text: String(pl.title) }));
-  if (pl.reason) card.append(el('p', { class: 'msg msg-err', style: 'margin:0 0 8px', text: String(pl.reason) }));
-  if (Array.isArray(pl.details) && pl.details.length) card.append(el('ul', { class: 'q-details' }, pl.details.map((t) => el('li', { text: String(t) }))));
-  const ctx = importQuestionContext(pl.context);
-  if (ctx) card.append(ctx);
-  if (Array.isArray(pl.instructions) && pl.instructions.length) {
-    card.append(el('ol', { class: 'q-details' }, pl.instructions.map((t) => el('li', { text: String(t) }))));
-  }
-  if (pl.attempt) card.append(el('p', { class: 'muted small', style: 'margin-bottom:8px', text: 'Attempt ' + pl.attempt + ' of 3.' }));
-  if (pl.question) card.append(el('p', { class: 'q-question', text: String(pl.question) }));
-
-  const msg = el('p', { class: 'msg' });
-  if (d.msgs[q.id]) setMsg(msg, 'err', d.msgs[q.id]);
-  const options = Array.isArray(q.options) ? q.options.filter((o) => o && typeof o.key === 'string') : [];
-  if (readOnly) {
-    // A finished job: show the choices it offered, but nothing is sendable
-    // (admin-api answers job_terminal). No control, no draft.
-    if (options.length) card.append(el('p', { class: 'muted small', text: 'Choices offered: ' + options.map((o) => String(o.label || o.key)).join(' · ') }));
-    card.append(el('p', { class: 'muted small', text: 'Never answered: the job finished first.' }));
-    return card;
-  }
-  if (options.length) {
-    const group = el('div', { class: 'opt-group' });
-    const buttons = [];
-    for (const o of options) {
-      const isAbort = o.key === 'abort';
-      const b = el('button', { class: 'btn opt-btn' + (isAbort ? ' btn-danger-outline' : '') }, String(o.label || o.key));
-      b.addEventListener('click', () => {
-        if (!isAbort) { importSendAnswer(q, o.key, msg, buttons); return; }
-        confirmModal({
-          title: 'Abort the run at this question?',
-          danger: true,
-          confirmLabel: 'Abort the run',
-          body: 'The runner stops here and the job ends as aborted. Nothing has been written. To try again you create a new import; every other answer you gave on this job is not reused.',
-          onConfirm: () => importSendAnswer(q, o.key, msg, buttons),
-        });
-      });
-      buttons.push(b);
-      group.append(b);
-    }
-    card.append(group);
-  } else {
-    // Free text (today: the cookie paste). Guarded: never prefilled from the
-    // row, kept only in memory until sent, and the row's answer is scrubbed
-    // by the runner and redacted by admin-api, so nothing ever echoes back.
-    const isCookie = q.kind === 'cookie';
-    const ta = el('textarea', { rows: '5', style: 'width:100%', class: 'edit-area', autocomplete: 'off', spellcheck: 'false',
-      placeholder: isCookie ? 'Paste the whole “Copy as cURL” command (or the raw Cookie header value) here' : 'Type the answer' });
-    ta.value = d.drafts[q.id] || '';
-    ta.addEventListener('input', () => { d.drafts[q.id] = ta.value; });
-    const send = el('button', { class: 'btn btn-primary btn-small' }, isCookie ? 'Send cookie to the runner' : 'Send answer');
-    send.addEventListener('click', () => {
-      const text = ta.value.trim();
-      if (!text) { setMsg(msg, 'err', isCookie ? 'Paste the cURL command first.' : 'Type an answer first.'); return; }
-      importSendAnswer(q, ta.value, msg, [send, ta]);
-    });
-    card.append(ta, el('div', { class: 'btn-row' }, send,
-      isCookie ? el('span', { class: 'muted small', text: 'A live credential for your dashboard login. The runner reads it once and scrubs it from the database; this panel never shows it again.' }) : null));
-  }
-  card.append(msg);
-  return card;
-}
-
-async function importSendAnswer(q, answer, msgEl, controls) {
-  const d = IMP.detail;
-  for (const c of controls) c.disabled = true;
-  setMsg(msgEl, 'info', 'Sending…');
-  try {
-    await adminApi('answer_import_question', { question_id: q.id, answer });
-    if (d) { delete d.drafts[q.id]; delete d.msgs[q.id]; }
-    toast('ok', 'Answer sent. The runner picks it up within about 10 seconds.');
-    await importRefreshDetail();
-  } catch (e) {
-    if (e.handled) return;
-    const text = e.code === 'already_answered' ? 'Already answered, by another admin or a moment ago. Refreshing.'
-      : e.code === 'invalid_answer' ? 'Not accepted: ' + e.message
-        : e.code === 'job_terminal' ? e.message.replace(/\.?\s*$/, '.') + ' Refreshing.'
-          : e.code === 'question_not_found' ? 'This question no longer exists (the runner restarted and re-asks). Refreshing.'
-            : e.message;
-    if (d) d.msgs[q.id] = text;
-    setMsg(msgEl, 'err', text);
-    for (const c of controls) c.disabled = false;
-    if (['already_answered', 'job_terminal', 'question_not_found'].includes(e.code)) importRefreshDetail();
-  }
-}
-
-function importAnswerLabel(q) {
-  if (q.kind === 'cookie') return 'Session cookie supplied (consumed by the runner, never shown)';
-  const a = q.answer;
-  if (Array.isArray(q.options)) {
-    const o = q.options.find((x) => x && x.key === a);
-    if (o) return String(o.label || o.key);
-  }
-  if (a && typeof a === 'object') return a.redacted || a.consumed ? '(consumed, not shown)' : truncate(JSON.stringify(a), 200);
-  return truncate(String(a), 200);
-}
-
-function importAnsweredQuestion(q) {
-  const pl = q.payload || {};
-  return el('div', { class: 'q-card q-answered' },
-    el('div', { class: 'row', style: 'gap:8px;margin-bottom:4px' },
-      el('span', { class: 'badge badge-neutral', text: importKindLabel(q.kind) }),
-      el('span', { class: 'mono-sm', text: '#' + q.id })),
-    pl.title ? el('p', { class: 'small', text: String(pl.title) }) : null,
-    el('p', { class: 'small' }, el('b', { text: 'Answer: ' }), importAnswerLabel(q)),
-    el('p', { class: 'muted small' }, 'by ' + (q.answered_by_email || '—') + ' · ', relTimeEl(q.answered_at)));
-}
-
-// ---- report rendering (the jsonb from buildReportData) ------------------------------
+// ---- shared bits ---------------------------------------------------------------------------
 function importExpandable(title, count, buildBody, opts = {}) {
   const clean = !count;
   const head = el('button', { class: 'check-head', type: 'button' },
     opts.badge || null,
     el('span', { class: 'strong', text: title }),
-    el('span', { class: 'muted', text: clean ? 'none' : (opts.countText !== undefined ? opts.countText : intFmt(count) + (opts.unit ? ' ' + opts.unit : '')) }),
+    el('span', { class: 'muted', text: clean ? (opts.noneText || 'none') : (opts.countText !== undefined ? opts.countText : intFmt(count) + (opts.unit ? ' ' + opts.unit : '')) }),
     el('span', { class: 'grow' }),
     el('span', { class: 'muted', text: clean ? '' : '▾' }));
   const body = el('div', { class: 'check-body hidden' });
@@ -3069,402 +2897,913 @@ function importExpandable(title, count, buildBody, opts = {}) {
 
 // rows: plain objects · cols: [{key, label, cls?, fmt?}]
 function importObjTable(rows, cols) {
-  const fmt = (c, v) => {
-    if (c.fmt) return c.fmt(v);
+  const fmt = (c, v, r) => {
+    if (c.fmt) return c.fmt(v, r);
     if (v === null || v === undefined) return '—';
     if (typeof v === 'boolean') return v ? 'Yes' : 'No';
     if (Array.isArray(v)) return v.length ? v.map((x) => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(', ') : '—';
     if (typeof v === 'object') return truncate(JSON.stringify(v), 120);
-    if (typeof v === 'number' && /volume|price|amount|commission|total|fold_in/.test(c.key)) return money(v);
+    if (typeof v === 'number' && /volume|price|amount|commission|total|paid|sum/.test(c.key)) return money(v);
     if (/date/.test(c.key) && typeof v === 'string') return fmtISODate(v);
     return String(v);
   };
   return buildTable(cols.map((c) => ({ label: c.label, cls: c.cls || null })),
-    rows.map((r) => ({ cells: cols.map((c) => fmt(c, r[c.key])) })));
-}
-
-const IMPORT_RO_CLASSES = [
-  ['already_on_account', 'Already on the account', 'In the app already, so the import left them alone; their commissions are untouched here. The reconcile tool stamps paid truth on existing deals.'],
-  ['absent_from_listing', 'Absent from the all-deals report', 'Paid on the commission report but not in the all-deals PDF. Import them with a targeted follow-up job.'],
-  ['excluded_by_gate', 'Excluded by the include gate', 'Listing rows the include gate rejects: non-sale, $0 gross, type E, or an unknown origin code. Never imported.'],
-  ['split_shell', 'Split shells', 'Split siblings of kept deals that did not fold automatically; the operator decision on each is in its reason.'],
-  ['could_not_scrape', 'Could not scrape', 'Listed under could-not-scrape: enter by hand.'],
-  ['operator_skipped', 'Skipped by operator', 'Skipped by a decision this run (blocking or mismatch).'],
-  ['not_targeted', 'Not targeted this run', 'Eligible listing rows outside this targeted run\u2019s account list. Import them with a full or targeted job.'],
-  ['unclassified', 'Unclassified', 'Eligible listing rows that produced no record. Investigate.'],
-  ['unknown', 'Unclassified (no context)', 'The merge ran without a classification context.'],
-];
-const IMPORT_RO_COLS = [{ key: 'account', label: 'Account' }, { key: 'status', label: 'Report bucket' }, { key: 'amount', label: 'Amount', cls: 'num' }, { key: 'reason', label: 'Why' }];
-
-// Report-only groups grouped by class, one expandable per class with its explanation.
-function importReportOnlyByClass(cm) {
-  const wrap = el('div', {});
-  const rows = Array.isArray(cm.report_only) ? cm.report_only : [];
-  for (const [cls, label, why] of IMPORT_RO_CLASSES) {
-    const mine = rows.filter((x) => (x.class || 'unknown') === cls);
-    if (!mine.length && cls !== 'absent_from_listing' && cls !== 'already_on_account') continue;
-    wrap.append(importExpandable('Report-only: ' + label.toLowerCase(), mine.length, () => importObjTable(mine, IMPORT_RO_COLS), { plain: why }));
-  }
-  return wrap;
-}
-
-function importShellSections(cm) {
-  const wrap = el('div', {});
-  wrap.append(importExpandable('Folded split shells', (cm.folded || []).length, () =>
-    importObjTable((cm.folded || []).map((f) => ({ kept_account: f.kept_account, shells: f.shells.map((s) => s.account + ' ' + money(s.amount)).join(', '), kept_paid: f.kept_paid, sum: f.sum, rate: f.rate, volume: f.volume })),
-      [{ key: 'kept_account', label: 'Kept deal' }, { key: 'shells', label: 'Shells folded' }, { key: 'kept_paid', label: 'Kept paid', cls: 'num' }, { key: 'sum', label: 'New commission', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'volume', label: 'Volume', cls: 'num' }]),
-    { plain: 'Paperwork rows whose paid line completes the kept deal: kept + shell equals rate times volume within one dollar, so the amount folds into the kept deal (import_metadata.split_shell_folded).' }));
-  wrap.append(importExpandable('Split shells folded by operator (flagged)', (cm.flagged_shells || []).length, () =>
-    importObjTable(cm.flagged_shells, [{ key: 'kept_account', label: 'Kept deal' }, { key: 'account', label: 'Shell' }, { key: 'amount', label: 'Amount added', cls: 'num' }, { key: 'implied_rate', label: 'Implied rate', cls: 'num' }]),
-    { plain: 'Amounts that did not reconcile but were folded on your decision. Each kept deal carries import_metadata.split_shell_flag.', badge: (cm.flagged_shells || []).length ? severityBadge('warn') : null }));
-  wrap.append(importExpandable('Split shells declared own deals (enter manually)', (cm.own_deal_shells || []).length, () =>
-    importObjTable(cm.own_deal_shells, [{ key: 'account', label: 'Shell' }, { key: 'kept_account', label: 'Sibling of' }, { key: 'amount', label: 'Paid', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }]),
-    { plain: 'Shells you declared their own deals. They are not imported; enter each in the app by hand with the paid figure.' }));
-  wrap.append(importExpandable('Kept earned by operator (cancelled but paid, gap not computable)', (cm.kept_earned || []).length, () =>
-    importObjTable(cm.kept_earned, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Status' }, { key: 'paid_amount', label: 'Paid', cls: 'num' }, { key: 'paid_rate', label: 'Rate', cls: 'num' }, { key: 'source', label: 'Why asked' }, { key: 'by', label: 'Decided by' }]),
-    { plain: 'Records that classified cancel-family while the report shows them paid and the bad-trade gap rule never ran (PDF-absent recovery, or no cancel date). You answered keep earned: imported as earned at the paid figures, with import_metadata.operator_keep_earned.', badge: (cm.kept_earned || []).length ? severityBadge('warn') : null }));
-  wrap.append(importExpandable('Rate from report (unpaid, verify with accounting)', (cm.rate_from_report || []).length, () =>
-    importObjTable(cm.rate_from_report, [{ key: 'account', label: 'Account' }, { key: 'rate', label: 'Report rate', cls: 'num' }, { key: 'amount_before', label: 'Computed', cls: 'num' }, { key: 'amount_after', label: 'At report rate', cls: 'num' }, { key: 'bucket', label: 'Bucket' }]),
-    { plain: 'Live earned deals the report shows NOT PAID but with a rate line. The rate is applied (source manual, so the app never recomputes it); the unpaid amount is not taken. Verify each with accounting.', badge: (cm.rate_from_report || []).length ? severityBadge('warn') : null }));
-  return wrap;
-}
-
-const IMPORT_RECON_BUCKETS = [
-  ['imported', 'Imported', 'Listing rows that became candidate records (tombstones included).'],
-  ['excluded_by_gate', 'Include gate', 'Rejected by the include gate: non-sale, $0 gross, negative gross, or type E.'],
-  ['excluded_D', 'Unknown origin', 'Origin code outside N/U/E (D or a new letter). Money-bearing ones were asked about.'],
-  ['already_on_account', 'Already on the account', 'Dedupe: the account had the deal before this run.'],
-  ['operator_skipped', 'Skipped by operator', 'Skipped by a blocking or mismatch decision this run.'],
-  ['could_not_scrape', 'Could not scrape', 'No match on the dashboard, or a scrape error you chose to proceed past.'],
-  ['not_targeted', 'Not targeted', 'A targeted run: eligible rows outside the account list. Import them with a full or targeted job.'],
-  ['unparsed', 'Unparsed', 'Lines that start with an account number but did not parse; each was skipped by decision.'],
-  ['unaccounted', 'Unaccounted', 'Eligible rows that produced no record and fit no bucket. Must be zero.'],
-];
-
-function importReconciliation(lr) {
-  if (!lr) return el('p', { class: 'muted small', text: 'No listing reconciliation in this report (older runner).' });
-  const wrap = el('div', {});
-  wrap.append(el('h3', { style: 'margin-bottom:8px' }, 'Listing reconciliation ', tip('Every row of the all-deals PDF lands in exactly one bucket, and the bucket counts must add up to the parsed row count. Every commission report group is matched or classified. Unaccounted must be zero.')));
-  if (!lr.complete || !lr.tie_out) {
-    wrap.append(el('div', { class: 'callout callout-danger' }, el('div', { class: 'callout-body' },
-      el('strong', { text: !lr.tie_out ? 'Tie-out failed' : 'Unaccounted rows: ' + intFmt(lr.unaccounted.length) }),
-      !lr.tie_out ? 'The bucket counts do not add up to the parsed row count.' : 'Eligible listing rows that produced no record: ' + lr.unaccounted.join(', '))));
-  } else {
-    wrap.append(el('p', { class: 'msg msg-ok', style: 'margin:0 0 8px', text: 'Tie-out PASS: ' + intFmt(lr.total_rows) + ' listing rows, every one accounted for.' }));
-  }
-  wrap.append(buildTable(
-    [{ label: 'Bucket' }, { label: 'Rows', cls: 'num' }, { label: 'What it means' }],
-    IMPORT_RECON_BUCKETS.map(([k, label, why]) => ({ cells: [el('span', {}, label, ' ', tip(why)), intFmt(lr.counts[k] || 0), el('span', { class: 'muted small', text: why })] })), { noCollapse: true }));
-  if (lr.imported_pdf_absent && lr.imported_pdf_absent.length) wrap.append(el('p', { class: 'muted small', style: 'margin-top:6px', text: 'Plus ' + intFmt(lr.imported_pdf_absent.length) + ' targeted PDF-absent import(s), not listing rows: ' + lr.imported_pdf_absent.join(', ') }));
-  const b = lr.buckets || {};
-  const lists = el('div', { style: 'margin-top:8px' });
-  lists.append(importExpandable('Include gate rows', (b.excluded_by_gate || []).length, () => importObjTable(b.excluded_by_gate, [{ key: 'account', label: 'Account' }, { key: 'flags', label: 'Flags' }])));
-  lists.append(importExpandable('Unknown origin rows', (b.excluded_D || []).length, () => importObjTable(b.excluded_D, [{ key: 'account', label: 'Account' }, { key: 'origin', label: 'Origin' }, { key: 'money_bearing', label: 'Money bearing' }])));
-  lists.append(importExpandable('Already on the account', (b.already_on_account || []).length, () => importObjTable(b.already_on_account, [{ key: 'account', label: 'Account' }])));
-  lists.append(importExpandable('Skipped by operator', (b.operator_skipped || []).length, () => importObjTable(b.operator_skipped, [{ key: 'account', label: 'Account' }, { key: 'decision', label: 'Decision' }])));
-  lists.append(importExpandable('Could not scrape', (b.could_not_scrape || []).length, () => importObjTable(b.could_not_scrape, [{ key: 'account', label: 'Account' }, { key: 'reason', label: 'Why' }])));
-  lists.append(importExpandable('Unparsed lines', (b.unparsed || []).length, () => importObjTable(b.unparsed, [{ key: 'line', label: 'Line', cls: 'num' }, { key: 'decision', label: 'Decision' }])));
-  wrap.append(lists);
-  if (lr.report_groups) wrap.append(el('p', { class: lr.report_groups.tie_out ? 'muted small' : 'msg msg-err', style: 'margin-top:8px', text: 'Commission report groups: ' + intFmt(lr.report_groups.total) + ' = matched ' + intFmt(lr.report_groups.matched) + ' + report-only ' + intFmt(lr.report_groups.report_only) + (lr.report_groups.tie_out ? ' (tie-out PASS)' : ' (tie-out FAIL)') }));
-  return wrap;
-}
-
-// The done screen's "create a targeted follow-up job" affordance for absent-from-listing accounts.
-function importTargetedFollowUp(job, email, accounts) {
-  const btn = el('button', { class: 'btn btn-small btn-primary' }, '＋ Create targeted follow-up job (' + intFmt(accounts.length) + ')');
-  btn.addEventListener('click', () => {
-    IMP.create = importFreshCreate();
-    IMP.create.targetId = job.target_user_id;
-    IMP.create.accounts = accounts.join(', ');
-    IMP.create.note = 'Prefilled for ' + email + ' with ' + intFmt(accounts.length) + ' account(s) the commission report paid but the all-deals report does not list. Both PDFs must be uploaded again: the runner purges a finished job’s files.';
-    nav('tools/import');
-  });
-  return el('div', { class: 'btn-row' }, btn, el('span', { class: 'muted small', text: 'Prefills the target and the accounts; you re-upload both PDFs.' }));
+    rows.map((r) => ({ cells: cols.map((c) => fmt(c, r[c.key], r)) })));
 }
 
 function importKV(label, value) {
   return el('div', { class: 'agg-item' }, el('dt', { text: label }), el('dd', {}, value == null ? '—' : value));
 }
 
-function importRenderReport(r) {
-  const root = el('div', { class: 'stack' });
-  const counts = r.counts || {};
-  const totals = r.totals || {};
-  const dt = r.deal_type || {};
-  const pend = r.penders || {};
-
-  // 1. candidates: what would be inserted
-  const cand = el('div', {});
-  cand.append(el('h3', { style: 'margin-bottom:8px' }, 'Candidates ', tip('Every deal the runner would insert, by money state. The structured report carries counts and totals; the deal-by-deal rows are in report.txt.')));
-  cand.append(el('div', { class: 'stat-grid' },
-    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Total deals' }), el('div', { class: 'stat-value', text: intFmt(counts.total) })),
-    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Earned' }), el('div', { class: 'stat-value', text: intFmt(counts.earned) }),
-      el('div', { class: 'stat-delta', text: money(totals.earned && totals.earned.volume) + ' volume · ' + money(totals.earned && totals.earned.commission) + ' commission' })),
-    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Pending' }), el('div', { class: 'stat-value', text: intFmt(counts.pending) }),
-      el('div', { class: 'stat-delta', text: money(totals.pending && totals.pending.volume) + ' volume · ' + money(totals.pending && totals.pending.commission) + ' commission' })),
-    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Cancelled' }), el('div', { class: 'stat-value', text: intFmt(counts.cancelled) }),
-      el('div', { class: 'stat-delta', text: intFmt(counts.cancelled_rescission) + ' rescission · ' + intFmt(counts.cancelled_unpaid) + ' unpaid pender · ' + money(totals.cancelled && totals.cancelled.volume) + ' volume' }))));
-  cand.append(el('dl', { class: 'agg-grid' },
-    importKV('Deal type', intFmt(dt.new) + ' new · ' + intFmt(dt.upgrade) + ' upgrade'),
-    importKV('VOA rate applied', intFmt(r.voa_rate_applied)),
-    importKV('Penders', intFmt(pend.total) + ' total · ' + intFmt(pend.came_good) + ' came good · ' + intFmt(pend.unpaid) + ' unpaid · ' + intFmt(pend.with_schedule) + ' with schedule'),
-    importKV('Bad-trade reclass', intFmt(r.bad_trade_reclass && r.bad_trade_reclass.count) + ' deal(s) · ' + money(r.bad_trade_reclass && r.bad_trade_reclass.commission_moved) + ' moved'),
-    importKV('Reference date', r.reference_date ? fmtISODate(r.reference_date) : '—'),
-    importKV('Generated', r.generated_at ? fmtDateTime(r.generated_at) : '—')));
-  if (Array.isArray(r.market_source) && r.market_source.length) {
-    cand.append(el('p', { class: 'muted small', style: 'margin-top:8px', text: 'Market sources: ' + r.market_source.map((m) => m.source + ' ' + intFmt(m.count)).join(' · ') }));
-  }
-  if (r.employee_guard && r.employee_guard.status) {
-    const g = r.employee_guard;
-    cand.append(el('p', { class: g.status === 'match' ? 'muted small' : 'msg msg-err', style: 'margin-top:6px',
-      text: 'Employee guard: ' + g.status + ' (PDF rep ' + (g.salesPerson || '?') + ', commission report rep ' + (g.employeeNumber || '?') + ').' }));
-  }
-  root.append(cand);
-
-  // 2. contract
-  const con = r.contract;
-  const conWrap = el('div', {});
-  conWrap.append(el('h3', { style: 'margin-bottom:8px' }, 'Data-model contract ',
-    tip('Every candidate row checked against the app’s field-pair rules before insert. A violation blocks the import; a flag is surfaced but never blocks.')));
-  if (!con) {
-    conWrap.append(el('p', { class: 'muted small', text: 'No contract result in this report.' }));
-  } else {
-    conWrap.append(el('p', { class: con.ok ? 'msg msg-ok' : 'msg msg-err', style: 'margin:0 0 8px',
-      text: (con.ok ? 'PASS' : 'FAIL') + ': ' + intFmt(con.total) + ' row(s) checked · ' + intFmt((con.violations || []).length) + ' violation(s) · ' + intFmt((con.flags || []).length) + ' flag(s)' }));
-    conWrap.append(importExpandable('Violations (block the import)', (con.violations || []).length, () =>
-      importObjTable(con.violations, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'message', label: 'Message' }]),
-      { badge: (con.violations || []).length ? severityBadge('error') : null }));
-    conWrap.append(importExpandable('Flags (review, never block)', (con.flags || []).length, () =>
-      importObjTable(con.flags, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'message', label: 'Message' }]),
-      { badge: (con.flags || []).length ? severityBadge('warn') : null }));
-    conWrap.append(importExpandable('Rules', (con.by_rule || []).length, () =>
-      importObjTable(con.by_rule, [{ key: 'name', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'severity', label: 'Severity' }, { key: 'pass', label: 'Pass', cls: 'num' }, { key: 'fail', label: 'Fail', cls: 'num' }]),
-      { unit: 'rules' }));
-  }
-  root.append(conWrap);
-
-  // 3. commission merge
-  const cm = r.commission;
-  const cmWrap = el('div', {});
-  cmWrap.append(el('h3', { style: 'margin-bottom:8px' }, 'Commission report ',
-    tip('Only with a commission report PDF: its paid lines are matched to the candidate deals by account. IMPORT lines override the computed commission; the rest stay computed and are listed for review.')));
-  if (!cm) {
-    cmWrap.append(el('p', { class: 'muted small', text: 'No commission report on this import: every commission is computed from the rate rules.' }));
-  } else {
-    const parse = cm.parse || {};
-    const m = cm.matching || {};
-    const imp = cm.imported || {};
-    const left = cm.left_computed || {};
-    const xc = cm.cross_checks || {};
-    cmWrap.append(el('dl', { class: 'agg-grid', style: 'margin-bottom:8px' },
-      importKV('Employee', cm.employee == null ? '—' : String(cm.employee)),
-      importKV('Parse', intFmt(parse.data_lines) + ' lines · ' + intFmt(parse.accounts) + ' accounts · ' + intFmt(parse.voa_excluded) + ' VOA excluded'),
-      importKV('Self-validation', parse.self_validation_pass ? 'PASS (' + money(parse.sum_amounts) + ' = grand total)' : 'FAIL (' + money(parse.sum_amounts) + ' vs ' + money(parse.grand_total) + ')'),
-      importKV('Matching', intFmt(m.deals) + ' deals · ' + intFmt(m.matched) + ' matched · ' + intFmt(m.missing_from_report) + ' missing from report · ' + intFmt(m.report_only) + ' report only'),
-      importKV('Imported (paid overrides)', intFmt(imp.count) + ' · ' + money(imp.total)),
-      importKV('Left computed', intFmt(left.skip_notpaid) + ' not paid · ' + intFmt(left.skip_pending) + ' pending · ' + intFmt(left.zero_rate) + ' zero rate · ' + intFmt(left.missing_from_report) + ' missing')));
-    if (cm.buckets && typeof cm.buckets === 'object') {
-      cmWrap.append(el('p', { class: 'muted small', style: 'margin-bottom:8px', text: 'Report buckets: ' + Object.entries(cm.buckets).map(([k, v]) => k + ' ' + intFmt(v)).join(' · ') }));
+async function importCopyText(text, what) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(text);
+    else {
+      const ta = el('textarea', { style: 'position:fixed;left:-9999px;top:0' });
+      ta.value = text;
+      document.body.append(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
     }
-    const impCols = [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' },
-      { key: 'computed_rate', label: 'Computed rate', cls: 'num' }, { key: 'imported_rate', label: 'Paid rate', cls: 'num' },
-      { key: 'computed_amount', label: 'Computed', cls: 'num' }, { key: 'imported_amount', label: 'Paid', cls: 'num' }, { key: 'flags', label: 'Flags' }];
-    cmWrap.append(importExpandable('Paid overrides (IMPORT bucket)', (imp.rows || []).length, () => importObjTable(imp.rows, impCols),
-      { plain: 'Deals whose commission the report’s paid figure replaces. Flags mark a rate or amount that disagrees with the computed one.' }));
-    cmWrap.append(importShellSections(cm));
-    cmWrap.append(importExpandable('Missing from the commission report', (cm.missing_from_report_accounts || []).length, () => el('p', { class: 'mono-sm', text: (cm.missing_from_report_accounts || []).join(', ') }),
-      { plain: 'Candidate deals with no lines on the commission report: usually very recent, or paid under another account number. They keep their computed figures.' }));
-    cmWrap.append(el('p', { class: 'muted small', style: 'margin:10px 0 4px', text: 'Report-only groups, classified (' + intFmt((cm.report_only || []).length) + '):' }));
-    cmWrap.append(importReportOnlyByClass(cm));
-    cmWrap.append(importExpandable('Chargeback review', (cm.chargeback_review || []).length, () =>
-      importObjTable(cm.chargeback_review, [{ key: 'account', label: 'Account' }, { key: 'suggested_amount', label: 'Suggested', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' },
-        { key: 'cancelled', label: 'Cancelled' }, { key: 'cancel_reason', label: 'Reason' }, { key: 'lines', label: 'Lines', fmt: (l) => Array.isArray(l) ? intFmt(l.length) + ' line(s)' : '—' }]),
-      { plain: 'Accounts the report shows as charged back. The runner does not apply these; review them by hand.' }));
-    cmWrap.append(importExpandable('Arbitrated', (cm.arbitrated || []).length, () =>
-      importObjTable(cm.arbitrated, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Status' }, { key: 'gap', label: 'Gap (days)', cls: 'num' }, { key: 'bucket', label: 'Bucket' }, { key: 'would_have_been', label: 'Would have been' }, { key: 'new_state', label: 'New state' }]),
-      { plain: 'Deals where the report’s paid truth overruled the PDF classification.' }));
-    const xcDefs = [
-      ['import_but_cancelled', 'Paid but cancelled', [{ key: 'account', label: 'Account' }, { key: 'report_amount', label: 'Report amount', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'cancel_reason', label: 'Cancel reason' }]],
-      ['skip_notpaid_earned', 'Not paid but earned', [{ key: 'account', label: 'Account' }, { key: 'computed_amount', label: 'Computed', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }]],
-      ['volume_mismatch', 'Volume mismatch', [{ key: 'account', label: 'Account' }, { key: 'report_volume', label: 'Report volume', cls: 'num' }, { key: 'deal_volume', label: 'Deal volume', cls: 'num' }]],
-      ['existing_owner_rate', 'Existing-owner rate', [{ key: 'account', label: 'Account' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'existing_owner', label: 'Existing owner' }, { key: 'deal_date', label: 'Deal date' }]],
-    ];
-    for (const [key, label, cols] of xcDefs) {
-      const rows = Array.isArray(xc[key]) ? xc[key] : [];
-      cmWrap.append(importExpandable('Cross-check: ' + label, rows.length, () => importObjTable(rows, cols)));
-    }
-    if (xc.existing_owner_pre_era_skipped) {
-      cmWrap.append(el('p', { class: 'muted small', style: 'margin-top:6px', text: intFmt(xc.existing_owner_pre_era_skipped) + ' existing-owner rate check(s) skipped as pre-era.' }));
-    }
+    toast('ok', 'Copied ' + (what || 'the list') + '.');
+  } catch (e) {
+    toast('err', 'Could not copy: ' + (e && e.message ? e.message : 'clipboard blocked'));
   }
-  root.append(cmWrap);
-
-  // 3b. listing reconciliation (airtight B1)
-  root.append(importReconciliation(r.listing_reconciliation));
-
-  // 4. everything else the runner noticed
-  const misc = el('div', {});
-  misc.append(el('h3', { style: 'margin-bottom:8px' }, 'Noticed on the way ',
-    tip('The lists the CLI prints after the candidates: accounts it could not scrape (enter those by hand after the import), dead never-paid contracts imported as tombstones, split groups, borderline cancels, and the decisions you made.')));
-  misc.append(importExpandable('Could not scrape (manual entry after import)', (r.could_not_scrape || []).length, () =>
-    importObjTable(r.could_not_scrape, [{ key: 'account', label: 'Account' }, { key: 'deal_date', label: 'Deal date' }, { key: 'owner', label: 'Owner' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'report_bucket', label: 'Report bucket' }, { key: 'report_amount', label: 'Report amount', cls: 'num' }, { key: 'reason', label: 'Why' }]),
-    { plain: 'Accounts in the PDF that the dashboard did not return, or kept erroring on after the retry rounds (the operator chose to proceed). They are not imported; enter them in the app by hand.' }));
-  misc.append(importExpandable('Unpaid tombstones', (r.tombstones || []).length, () =>
-    importObjTable(r.tombstones, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'deal_date', label: 'Deal date' }, { key: 'deal_type', label: 'Type' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'amount', label: 'Amount', cls: 'num' }, { key: 'cancel_reason', label: 'Cancel reason' }]),
-    { plain: 'Dead, never-paid contracts the dashboard no longer returns. They ARE imported, as $0 cancelled deals, so the book stays complete. Do not enter these by hand.' }));
-  misc.append(importExpandable('Split groups', (r.split_groups || []).length, () =>
-    importObjTable(r.split_groups, [{ key: 'accounts', label: 'Accounts' }, { key: 'asymmetry', label: 'Leg asymmetry' }]),
-    { plain: 'Accounts that share one sale split across contracts. Asymmetry means the legs disagree on volume.' }));
-  misc.append(importExpandable('Borderline cancels', (r.borderline || []).length, () =>
-    importObjTable(r.borderline, [{ key: 'account', label: 'Account' }, { key: 'gap', label: 'Gap (days)', cls: 'num' }, { key: 'payments', label: 'Payments', cls: 'num' }, { key: 'classified', label: 'Classified' }, { key: 'call', label: 'Call' }]),
-    { plain: 'Cancels near the bad-trade cutoff and how each was called.' }));
-  misc.append(importExpandable('Decisions you made', (r.decisions || []).length, () =>
-    importObjTable(r.decisions, [{ key: 'kind', label: 'Kind', fmt: (k) => importKindLabel(k) }, { key: 'key', label: 'Key' }, { key: 'answer', label: 'Answer' }]),
-    { plain: 'Every answered question folded into this run.' }));
-  misc.append(importExpandable('PDF-absent recoveries', (r.pdf_absent || []).length, () =>
-    importObjTable(r.pdf_absent, [{ key: 'account', label: 'Account' }, { key: 'provenance', label: 'Provenance' }]),
-    { plain: 'Deals the dashboard has that the PDF does not; recovered from dashboard data.' }));
-  misc.append(importExpandable('Targeted accounts excluded', (r.targeted_excluded || []).length, () =>
-    importObjTable(r.targeted_excluded, [{ key: 'account', label: 'Account' }, { key: 'reasons', label: 'Reasons' }, { key: 'probable_split_shell', label: 'Probable split shell' }])));
-  misc.append(importExpandable('Excluded type-D rows', (r.excluded_d || []).length, () =>
-    importObjTable(r.excluded_d, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'date', label: 'Date' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'sale', label: 'Sale' }, { key: 'money_bearing', label: 'Money bearing' }])));
-  misc.append(importExpandable('Sparse penders (no payment schedule)', (pend.sparse || []).length, () =>
-    importObjTable(pend.sparse, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Status' }])));
-  const san = r.sanity || {};
-  misc.append(importExpandable('Sanity: zero volume', (san.zero_volume || []).length, () => el('p', { class: 'mono-sm', text: (san.zero_volume || []).join(', ') })));
-  misc.append(importExpandable('Sanity: empty owners', (san.empty_owners || []).length, () => el('p', { class: 'mono-sm', text: (san.empty_owners || []).join(', ') })));
-  root.append(misc);
-
-  if (r.rules) {
-    root.append(el('p', { class: 'muted small', text: 'Rates used: new ' + pctFmt(r.rules.rate_new) + ' · upgrade ' + pctFmt(r.rules.rate_upgrade) + ' · VOA ' + pctFmt(r.rules.rate_voa) + ' · pender ' + pctFmt(r.rules.rate_pender) + ' · bad-trade cancel window ' + intFmt(r.rules.bad_trade_cancel_days) + ' days.' }));
-  }
-  return root;
 }
 
-// ---- results (done) --------------------------------------------------------------
-function importResultsCard(job, report, email, reportUrl, reportStatus, purgedAt) {
-  const card = el('div', { class: 'card' },
-    el('div', { class: 'card-title' }, el('h2', { text: 'Results' }), el('span', { class: 'badge badge-success', text: 'done' }),
-      tip('What actually landed: the insert counts, the reconcile of every imported deal now on the account, the post-insert contract re-check, and the lists that need your hands: manual entries, unmatched commission rows, and review flags.')));
-  if (!report) {
-    card.append(el('p', { class: 'msg msg-err', text: 'The job is done but carries no report.' }));
+const importPct = (r) => (r == null ? '—' : Number(r) + '%');
+const importTypeWord = (t) => (t === 'new' || t === 'N' ? 'new sale' : t === 'upgrade' || t === 'U' ? 'upgrade' : t ? String(t) : '—');
+
+// What Westgate did about a deal's commission, in words. paid = {state, amount, rate}.
+function importPaidWords(paid) {
+  if (!paid || !paid.state) return '—';
+  const at = paid.rate != null ? ' at ' + importPct(paid.rate) : '';
+  switch (paid.state) {
+    case 'paid': return 'Paid ' + money(paid.amount) + at;
+    case 'not_paid': return 'NOT PAID' + (paid.amount != null ? ' (would be ' + money(paid.amount) + at + ')' : '');
+    case 'pending': return 'Not paid yet' + (paid.amount != null ? ' (' + money(paid.amount) + at + ' due)' : '');
+    case 'chargeback': return 'Charged back' + (paid.amount != null ? ' (' + money(paid.amount) + ')' : '');
+    case 'review': return 'On the report without a rate';
+    case 'not_on_report': return 'Not on the commission report';
+    case 'no_report': return 'No commission report uploaded';
+    case 'unknown': return 'Not checked yet';
+    default: return String(paid.state);
+  }
+}
+
+// The facts table beside a question: one row per deal. Columns with nothing in them are dropped.
+function importFactsTable(rows, opts = {}) {
+  const list = (rows || []).filter(Boolean);
+  if (!list.length) return null;
+  const cols = [
+    { key: 'label', label: '', get: (f) => f._label || null },
+    { key: 'account', label: 'Account', get: (f) => f.account ? el('span', { class: 'mono-sm', text: f.account }) : null },
+    { key: 'owner', label: 'Owner', get: (f) => f.owner || null },
+    { key: 'deal_date', label: 'Date', get: (f) => f.deal_date ? fmtISODate(f.deal_date) : null },
+    { key: 'volume', label: 'Volume', cls: 'num', get: (f) => f.volume == null ? null : money(f.volume) },
+    { key: 'deal_type', label: 'Type', get: (f) => f.deal_type ? importTypeWord(f.deal_type) + (f.financed === true ? ', financed' : f.financed === false ? ', paid in full' : '') : (f.financed === true ? 'financed' : f.financed === false ? 'paid in full' : null) },
+    { key: 'status_desc', label: 'Westgate status', get: (f) => f.status_desc || null },
+    { key: 'paid', label: 'Westgate paid', get: (f) => (f.paid && f.paid.state && f.paid.state !== 'no_report' && f.paid.state !== 'unknown') ? importPaidWords(f.paid) : null },
+  ].filter((c) => list.some((f) => c.get(f) != null));
+  const t = buildTable(cols.map((c) => ({ label: c.label, cls: c.cls || null })),
+    list.map((f) => ({ cells: cols.map((c) => { const v = c.get(f); return v == null ? '—' : v; }) })), { noCollapse: true });
+  const wrap = el('div', { class: 'q-facts' }, t);
+  if (opts.more) wrap.append(el('p', { class: 'muted small', style: 'margin:4px 0 0', text: 'and ' + intFmt(opts.more) + ' more' }));
+  return wrap;
+}
+
+// ---- questions: one renderer, plain copy per kind ---------------------------------------
+// Each entry: headline(pl, rep) ≤ 12 words · meaning(pl, rep) one line or null ·
+// button(optionKey, runnerLabel, pl, rep) ≤ 8 words · done(key, answer, pl, rep) one sentence.
+const IMPORT_BLOCKING_WORDS = [
+  [/negative volume/i, 'Its volume is negative.'],
+  [/zero\/null volume|zero volume/i, 'It has no volume.'],
+  [/empty owner_names|no owner/i, 'It has no owner name.'],
+  [/missing dashboard details/i, 'The dashboard returned no details for it.'],
+  [/unknown origin type/i, 'The sales report marks it with a type we do not import, yet it carries money.'],
+];
+function importBlockingWords(reason) {
+  const r = String(reason || '');
+  for (const [re, words] of IMPORT_BLOCKING_WORDS) if (re.test(r)) return words;
+  return r ? r.split('\n')[0] : 'It could not be sorted into a deal.';
+}
+const importDivisionWord = (key, label) => (key === '__RAW__' ? 'kept as Westgate names it' : (label || key));
+const IMPORT_Q = {
+  division: {
+    headline: (pl) => 'Westgate calls this market “' + (pl.context && pl.context.division || pl.key) + '”. Which app market is it?',
+    meaning: (pl) => (pl.context && pl.context.count ? intFmt(pl.context.count) + (pl.context.count === 1 ? ' deal uses it.' : ' deals use it.') : null),
+    button: (key, label) => (key === '__RAW__' ? 'Keep Westgate’s name as is' : label),
+    done: (key, answer, pl, rep, label) => 'Westgate’s “' + key + '” market is ' + importDivisionWord(answer, label) + '.',
+  },
+  status: {
+    headline: (pl, rep) => 'Westgate status “' + (pl.context && pl.context.status_desc || pl.key) + '”: did ' + rep + ' get paid on these?',
+    meaning: () => null,
+    button: (key, label, pl, rep) => (key === 'cancelled' ? 'No. Cancelled, no commission' : key === 'earned' ? 'Yes. ' + rep + ' keeps the commission' : label),
+    done: (key, answer, pl, rep) => '“' + key + '” deals are ' + (answer === 'cancelled' ? 'cancelled, no commission.' : answer === 'earned' ? 'earned; ' + rep + ' keeps the commission.' : String(answer) + '.'),
+  },
+  mismatch: {
+    headline: () => 'The sales report and the dashboard disagree on this deal.',
+    meaning: (pl) => {
+      const c = pl.context || {};
+      const bits = [];
+      if (c.volume && c.volume.mismatch) bits.push('Volume: report ' + money(c.volume.pdf) + ', dashboard ' + money(c.volume.dashboard) + '.');
+      if (c.type && c.type.mismatch) bits.push('Type: report ' + importTypeWord(c.type.pdf) + ', dashboard ' + importTypeWord(c.type.dashboard) + '.');
+      return bits.join(' ') || null;
+    },
+    button: (key, label) => (key === 'pdf' ? 'Use the sales report' : key === 'dashboard' ? 'Use the dashboard' : key === 'skip' ? 'Leave this deal out' : label),
+    done: (key, answer) => 'Deal ' + key + ': ' + (answer === 'pdf' ? 'the sales report’s numbers were used.' : answer === 'dashboard' ? 'the dashboard’s numbers were used.' : 'left out.'),
+  },
+  blocking: {
+    headline: () => 'This deal cannot be imported as it stands.',
+    meaning: (pl) => importBlockingWords(pl.context && pl.context.reason),
+    button: (key, label) => (key === 'skip' ? 'Leave this deal out' : key === 'abort' ? 'Stop the import' : label),
+    done: (key, answer) => (answer === 'abort' ? 'The import was stopped at deal ' + key + '.' : 'Deal ' + key + ' was left out.'),
+  },
+  penderLiveness: {
+    headline: (pl) => 'Westgate status “' + (pl.context && pl.context.status_desc || pl.key) + '”: are these financed deals still live?',
+    meaning: () => 'No payment schedule on file, so we cannot tell.',
+    button: (key, label) => (key === 'live' ? 'Still live, commission pending' : key === 'terminal' ? 'Dead, no commission' : label),
+    done: (key, answer) => '“' + key + '” financed deals are ' + (answer === 'live' ? 'still live.' : 'dead, no commission.'),
+  },
+  dashboardDealType: {
+    headline: () => 'Is this deal a new sale or an upgrade?',
+    meaning: () => 'The sales report does not list it and the dashboard does not say.',
+    button: (key, label) => (key === 'new' ? 'New sale' : key === 'upgrade' ? 'Upgrade' : label),
+    done: (key, answer) => 'Deal ' + key + ' is ' + (answer === 'new' ? 'a new sale.' : 'an upgrade.'),
+  },
+  dashboardPenderStatus: {
+    headline: () => 'Was this deal financed, or paid in full at signing?',
+    meaning: () => 'The sales report does not list it and the dashboard does not say.',
+    button: (key, label) => (key === 'pender' ? 'Financed' : key === 'non-pender' ? 'Paid in full at signing' : label),
+    done: (key, answer) => 'Deal ' + key + ' was ' + (answer === 'pender' ? 'financed.' : 'paid in full at signing.'),
+  },
+  tradeEquity: {
+    headline: () => 'The price is higher than the volume on this new deal.',
+    meaning: (pl) => (pl.context ? 'Price ' + money(pl.context.purchase_price) + ', volume ' + money(pl.context.volume) + '. The app needs them equal.' : 'The app needs them equal.'),
+    button: (key, label) => (key === 'align' ? 'Set the price to the volume' : key === 'abort' ? 'Stop the import' : label),
+    done: (key, answer) => (answer === 'abort' ? 'The import was stopped at deal ' + key + '.' : 'Deal ' + key + ': the price was set to the volume.'),
+  },
+  tombstoneDealType: {
+    headline: () => 'Was this dead deal a new sale or an upgrade?',
+    meaning: () => 'Never paid and gone from the dashboard. It is recorded as cancelled.',
+    button: (key, label) => (key === 'new' ? 'New sale' : key === 'upgrade' ? 'Upgrade' : label),
+    done: (key, answer) => 'Dead deal ' + key + ' is recorded as ' + (answer === 'new' ? 'a new sale.' : 'an upgrade.'),
+  },
+  tombstoneCancelReason: {
+    headline: () => 'Why did this dead deal never pay?',
+    meaning: () => 'Either way it is recorded as cancelled with no commission.',
+    button: (key, label) => (key === 'unpaid_pender' ? 'The down payment never finished' : key === 'rescission' ? 'The customer rescinded' : label),
+    done: (key, answer) => 'Dead deal ' + key + ': ' + (answer === 'unpaid_pender' ? 'the down payment never finished.' : answer === 'rescission' ? 'the customer rescinded.' : String(answer) + '.'),
+  },
+  cookie: {
+    headline: () => 'The runner needs a fresh dashboard sign-in.',
+    meaning: (pl) => pl.reason || null,
+    button: (key, label) => label,
+    done: () => 'A dashboard sign-in was pasted and used once.',
+  },
+  scrapeIncomplete: {
+    headline: (pl) => intFmt(pl.count) + (pl.count === 1 ? ' account could not be pulled from the dashboard.' : ' accounts could not be pulled from the dashboard.'),
+    meaning: () => null,
+    button: (key, label) => (key === 'retry' ? 'Try again now' : key === 'proceed' ? 'Go on without them' : label),
+    done: (key, answer, pl) => (pl && pl.count ? intFmt(pl.count) + ' accounts' : 'Some accounts') + ' the dashboard would not return were ' + (answer === 'retry' ? 'retried.' : 'left out.'),
+  },
+  unparsedRow: {
+    headline: (pl) => 'Line ' + ((pl.context && pl.context.line) || String(pl.key || '').replace(/^line-/, '')) + ' of the sales report could not be read.',
+    meaning: () => null,
+    button: (key, label) => (key === 'skip' ? 'Skip this line' : key === 'abort' ? 'Stop the import' : label),
+    done: (key, answer) => 'Line ' + String(key).replace(/^line-/, '') + ' of the sales report was ' + (answer === 'skip' ? 'skipped.' : 'where the import stopped.'),
+  },
+  splitShellReview: {
+    headline: (pl) => 'Westgate paid ' + money(pl.context && pl.context.shell_paid) + ' on a paperwork twin of ' + ((pl.context && pl.context.kept_account) || 'another deal') + '.',
+    meaning: (pl) => (pl.context ? 'Added to the kept deal it would be ' + importPct(pl.context.implied_rate) + ' of ' + money(pl.context.kept_volume) + ', not ' + importPct(pl.context.kept_rate) + '.' : null),
+    button: (key, label) => (key === 'fold_with_flag' ? 'Add it to the kept deal, flagged' : key === 'own_deal' ? 'Separate deal, I will enter it' : key === 'leave' ? 'Leave it out' : label),
+    done: (key, answer, pl) => {
+      const amt = pl && pl.context && pl.context.shell_paid != null ? 'The ' + money(pl.context.shell_paid) + ' payment' : 'The payment';
+      const kept = pl && pl.context && pl.context.kept_account ? ' deal ' + pl.context.kept_account : ' the kept deal';
+      return amt + ' on ' + key + ' was ' + (answer === 'fold_with_flag' ? 'added to' + kept + ' and flagged.' : answer === 'own_deal' ? 'set aside to enter by hand as its own deal.' : 'left out.');
+    },
+  },
+  cancelledButPaid: {
+    headline: (pl, rep) => 'Cancelled, but Westgate paid ' + money(pl.paid_amount != null ? pl.paid_amount : (pl.context && pl.context.paid_amount)) + '. Did ' + rep + ' keep it?',
+    meaning: () => null,
+    button: (key, label, pl, rep) => (key === 'keep_earned' ? 'Yes, ' + rep + ' kept it: count it earned' : key === 'keep_cancelled' ? 'No: cancelled, no commission' : label),
+    done: (key, answer, pl, rep) => {
+      const amt = pl && (pl.paid_amount != null ? pl.paid_amount : (pl.context && pl.context.paid_amount));
+      return 'Deal ' + key + ': ' + (answer === 'keep_earned' ? rep + ' kept ' + (amt != null ? 'the ' + money(amt) : 'the payment') + ', counted earned.' : 'cancelled, no commission.');
+    },
+  },
+};
+const IMPORT_Q_FALLBACK = {
+  headline: (pl) => pl.title || 'A question from the import',
+  meaning: (pl) => pl.question || null,
+  button: (key, label) => label || key,
+  done: (key, answer) => 'Deal ' + key + ': ' + String(answer) + '.',
+};
+function importQ(kind) { return IMPORT_Q[kind] || IMPORT_Q_FALLBACK; }
+
+function importQuestionFacts(q) {
+  const pl = q.payload || {};
+  if (q.kind === 'splitShellReview' && (pl.facts || pl.kept_facts)) {
+    const rows = [];
+    if (pl.facts) rows.push(Object.assign({ _label: 'Paperwork twin' }, pl.facts));
+    if (pl.kept_facts) rows.push(Object.assign({ _label: 'Kept deal' }, pl.kept_facts));
+    return importFactsTable(rows);
+  }
+  if (q.kind === 'scrapeIncomplete' && Array.isArray(pl.accounts) && pl.accounts.length) {
+    return el('div', { class: 'q-facts' }, buildTable([{ label: 'Account' }, { label: 'What the dashboard said' }, { label: 'Tries', cls: 'num' }],
+      pl.accounts.map((a) => ({ cells: [el('span', { class: 'mono-sm', text: a.account }), a.reason || '—', intFmt(a.attempts)] })), { noCollapse: true }));
+  }
+  if (q.kind === 'unparsedRow' && pl.context && pl.context.masked) {
+    return el('p', { class: 'mono-sm q-line', text: String(pl.context.masked) });
+  }
+  if (Array.isArray(pl.rows) && pl.rows.length) return importFactsTable(pl.rows, { more: pl.more || 0 });
+  if (pl.facts) return importFactsTable([pl.facts]);
+  // Older payloads (before the facts arrived): the account alone.
+  const acct = pl.context && pl.context.account;
+  return acct ? importFactsTable([{ account: String(acct) }]) : null;
+}
+
+// One renderer for every kind: headline, one line, the facts, consequence-labeled buttons.
+function importQuestionCard(q, d, readOnly, rep) {
+  const pl = q.payload || {};
+  const copy = importQ(q.kind);
+  const card = el('div', { class: 'q-card ' + (readOnly ? 'q-answered' : 'q-open') });
+  card.append(el('p', { class: 'q-title', text: copy.headline(pl, rep) }));
+  const meaning = copy.meaning(pl, rep);
+  if (meaning) card.append(el('p', { class: 'q-meaning', text: meaning }));
+  const facts = importQuestionFacts(q);
+  if (facts) card.append(facts);
+  if (q.kind === 'cookie' && Array.isArray(pl.instructions) && pl.instructions.length) {
+    card.append(el('ol', { class: 'q-details' }, pl.instructions.map((t) => el('li', { text: String(t) }))));
+    if (pl.attempt) card.append(el('p', { class: 'muted small', style: 'margin-bottom:8px', text: 'Try ' + pl.attempt + ' of 3.' }));
+  }
+
+  const msg = el('p', { class: 'msg' });
+  if (d && d.msgs && d.msgs[q.id]) setMsg(msg, 'err', d.msgs[q.id]);
+  const options = Array.isArray(q.options) ? q.options.filter((o) => o && typeof o.key === 'string') : [];
+  if (readOnly) {
+    card.append(el('p', { class: 'muted small', text: 'Never answered: the import ended first.' }));
     return card;
   }
-  if (report.nothing_to_import) {
-    card.append(el('div', { class: 'callout callout-info' }, el('div', { class: 'callout-body' },
-      el('strong', { text: 'Nothing to import' }),
-      'The account already had every requested deal (' + intFmt(report.already_present) + ' already present). Nothing was written.')));
-    card.append(importReportLink(reportUrl, reportStatus, purgedAt));
-    return card;
-  }
-  const ins = report.insert || {};
-  const rec = report.reconcile || {};
-  const pc = report.post_contract;
-  card.append(el('div', { class: 'stat-grid' },
-    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Inserted' }), el('div', { class: 'stat-value', text: intFmt(ins.inserted) }),
-      el('div', { class: 'stat-delta', text: 'of ' + intFmt(ins.attempted) + ' attempted · ' + intFmt(ins.already_present) + ' already present, skipped' })),
-    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Promised by the dry-run' }), el('div', { class: 'stat-value', text: intFmt(rec.promised) })),
-    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Imported deals on the account' }), el('div', { class: 'stat-value', text: intFmt(rec.imported_total) }),
-      el('div', { class: 'stat-delta', text: intFmt(rec.earned) + ' earned · ' + intFmt(rec.pending) + ' pending · ' + intFmt(rec.cancelled) + ' cancelled (' + intFmt(rec.cancelled_rescission) + ' rescission, ' + intFmt(rec.cancelled_unpaid) + ' unpaid)' })),
-    el('div', { class: 'stat-card' }, el('div', { class: 'stat-label', text: 'Tombstoned' }), el('div', { class: 'stat-value', text: intFmt(rec.tombstoned) }),
-      el('div', { class: 'stat-delta', text: 'never-paid contracts imported as $0 cancels' }))));
-
-  // post-insert contract
-  if (pc && pc.ok === true) {
-    card.append(el('p', { class: 'msg msg-ok', style: 'margin:0 0 10px', text: 'Post-insert contract: PASS. ' + intFmt(pc.checked) + ' landed row(s) re-read and re-checked' + (pc.flags ? ' (' + intFmt(pc.flags) + ' non-blocking flag(s))' : '') + '.' }));
-  } else if (pc && pc.ok === false) {
-    card.append(el('div', { class: 'callout callout-danger' }, el('div', { class: 'callout-body' },
-      el('strong', { text: 'Post-insert contract FAILED: ' + intFmt((pc.violations || []).length) + ' violation(s) in rows already written' }),
-      'The data is on the account. Correct these rows by hand (open each deal from Users).',
-      importObjTable(pc.violations || [], [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'message', label: 'Message' }]))));
-  } else if (pc && pc.ok === null) {
-    card.append(el('p', { class: 'msg msg-err', style: 'margin:0 0 10px', text: 'Post-insert contract: could not verify what landed (' + (pc.error || 'read failed') + '). Run the integrity check on the user.' }));
-  } else if (!pc) {
-    card.append(el('p', { class: 'muted small', style: 'margin:0 0 10px', text: 'Post-insert contract: nothing to check (no rows in the plan).' }));
-  }
-
-  // manual-entry checklist
-  const manual = Array.isArray(rec.manual_entry) ? rec.manual_entry.map(String) : [];
-  const byAcct = new Map((report.could_not_scrape || []).map((x) => [String(x.account), x]));
-  const manualRows = manual.map((a) => Object.assign({ account: a }, byAcct.get(a) || {}));
-  // Split shells the operator declared own deals join the checklist with their paid figure.
-  for (const s of (rec.own_deal_shells || [])) manualRows.push({ account: String(s.account), report_bucket: 'IMPORT', report_amount: s.amount, reason: 'split shell of ' + s.kept_account + ': own deal (paid ' + money(s.amount) + (s.rate != null ? ' at ' + s.rate + '%' : '') + ')' });
-  card.append(importExpandable('Missing deals: enter these by hand', manualRows.length, () => {
-    const wrap = el('div', {});
-    wrap.append(buildTable(
-      [{ label: '' }, { label: 'Account' }, { label: 'Deal date' }, { label: 'Owner' }, { label: 'Volume', cls: 'num' }, { label: 'Report bucket' }, { label: 'Report amount', cls: 'num' }, { label: 'Why', tip: 'No match: the dashboard has no record for the account. Scrape error: the dashboard kept failing on it after the retry rounds and the operator chose to proceed, so it was never scraped.' }],
-      manualRows.map((m) => ({ cells: [el('input', { type: 'checkbox', title: 'Entered (this checkbox is only a reading aid; it is not saved)' }),
-        el('span', { class: 'mono-sm', text: m.account }), m.deal_date ? fmtISODate(m.deal_date) : '—', m.owner || '—', m.volume == null ? '—' : money(m.volume), m.report_bucket || '—', m.report_amount == null ? '—' : money(m.report_amount), m.reason || 'no match on the dashboard'] })),
-      { noCollapse: true }));
-    wrap.append(el('div', { class: 'btn-row' }, el('button', { class: 'btn btn-small', onclick: () =>
-      downloadBlob('manual-entry-' + String(email).replace(/[^a-z0-9.@-]+/gi, '_') + '.csv', 'text/csv', toCSV(manualRows.map((m) => ({ account: m.account, deal_date: m.deal_date || '', owner: m.owner || '', volume: m.volume == null ? '' : m.volume, report_bucket: m.report_bucket || '', report_amount: m.report_amount == null ? '' : m.report_amount, why: m.reason || 'no match on the dashboard' })))) }, '⬇ CSV')));
-    return wrap;
-  }, { plain: 'Accounts from the PDF that the dashboard did not return (no match) or kept erroring on (scrape error, operator chose to proceed), minus the ones imported as tombstones. They are not on the account: enter each one in the app by hand.',
-    badge: manualRows.length ? severityBadge('warn') : null }));
-
-  // unmatched commission rows + review flags
-  const cm = report.commission;
-  if (cm) {
-    const absent = (cm.report_only || []).filter((x) => x.class === 'absent_from_listing').map((x) => String(x.account));
-    if (absent.length) {
-      card.append(el('div', { class: 'callout callout-info' }, el('div', { class: 'callout-body' },
-        el('strong', { text: intFmt(absent.length) + ' paid deal(s) are not in the all-deals report' }),
-        'The commission report paid these accounts, but the all-deals PDF does not list them, so this run could not import them: ' + absent.join(', ') + '.',
-        importTargetedFollowUp(job, email, absent))));
+  if (options.length) {
+    const group = el('div', { class: 'opt-group' });
+    const buttons = [];
+    for (const o of options) {
+      const isAbort = o.key === 'abort';
+      const b = el('button', { class: 'btn opt-btn' + (isAbort ? ' btn-danger-outline' : '') }, copy.button(o.key, String(o.label || o.key), pl, rep));
+      b.addEventListener('click', () => {
+        if (!isAbort) { importSendAnswer(q, o.key, msg, buttons); return; }
+        confirmModal({
+          title: 'Stop the import here?',
+          danger: true,
+          confirmLabel: 'Stop the import',
+          body: 'Nothing has been written to ' + rep + '’s book. To try again you start a new import.',
+          onConfirm: () => importSendAnswer(q, o.key, msg, buttons),
+        });
+      });
+      buttons.push(b);
+      group.append(b);
     }
-    card.append(importShellSections(cm));
-    card.append(el('p', { class: 'muted small', style: 'margin:10px 0 4px', text: 'Report-only groups, classified (' + intFmt((cm.report_only || []).length) + '):' }));
-    card.append(importReportOnlyByClass(cm));
-    const flagged = (cm.imported && Array.isArray(cm.imported.rows) ? cm.imported.rows : []).filter((x) => Array.isArray(x.flags) && x.flags.length);
-    card.append(importExpandable('Underpayment and rate flags', flagged.length, () =>
-      importObjTable(flagged, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'computed_rate', label: 'Computed rate', cls: 'num' }, { key: 'imported_rate', label: 'Paid rate', cls: 'num' },
-        { key: 'computed_amount', label: 'Computed', cls: 'num' }, { key: 'imported_amount', label: 'Paid', cls: 'num' }, { key: 'flags', label: 'Flags' }]),
-      { plain: 'Paid overrides whose rate or amount disagrees with the computed figure. The paid figure was imported; the flag is for you to chase.' }));
-    card.append(importExpandable('Chargeback review', (cm.chargeback_review || []).length, () =>
-      importObjTable(cm.chargeback_review, [{ key: 'account', label: 'Account' }, { key: 'suggested_amount', label: 'Suggested', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'cancelled', label: 'Cancelled' }, { key: 'cancel_reason', label: 'Reason' }])));
-    const xc = cm.cross_checks || {};
-    const xcCount = ['import_but_cancelled', 'skip_notpaid_earned', 'volume_mismatch', 'existing_owner_rate'].reduce((n, k) => n + (Array.isArray(xc[k]) ? xc[k].length : 0), 0);
-    card.append(importExpandable('Commission cross-checks', xcCount, () => el('div', {},
-      importObjTable(xc.import_but_cancelled || [], [{ key: 'account', label: 'Paid but cancelled' }, { key: 'report_amount', label: 'Report amount', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'cancel_reason', label: 'Reason' }]),
-      importObjTable(xc.skip_notpaid_earned || [], [{ key: 'account', label: 'Not paid but earned' }, { key: 'computed_amount', label: 'Computed', cls: 'num' }, { key: 'rate', label: 'Rate', cls: 'num' }]),
-      importObjTable(xc.volume_mismatch || [], [{ key: 'account', label: 'Volume mismatch' }, { key: 'report_volume', label: 'Report volume', cls: 'num' }, { key: 'deal_volume', label: 'Deal volume', cls: 'num' }]),
-      importObjTable(xc.existing_owner_rate || [], [{ key: 'account', label: 'Existing-owner rate' }, { key: 'rate', label: 'Rate', cls: 'num' }, { key: 'existing_owner', label: 'Existing owner' }, { key: 'deal_date', label: 'Deal date' }]))));
+    card.append(group);
+  } else {
+    // Free text (the pasted sign-in). Never prefilled, kept only in memory until sent; the
+    // runner erases the answer once read and the panel never shows it again.
+    const isCookie = q.kind === 'cookie';
+    const ta = el('textarea', { rows: '4', style: 'width:100%', class: 'edit-area', autocomplete: 'off', spellcheck: 'false',
+      placeholder: isCookie ? 'Paste the copied text here' : 'Type the answer' });
+    ta.value = (d && d.drafts && d.drafts[q.id]) || '';
+    ta.addEventListener('input', () => { if (d && d.drafts) d.drafts[q.id] = ta.value; });
+    const send = el('button', { class: 'btn btn-primary btn-small' }, isCookie ? 'Paste' : 'Send');
+    send.addEventListener('click', () => {
+      const text = ta.value.trim();
+      if (!text) { setMsg(msg, 'err', isCookie ? 'Paste the copied text first.' : 'Type an answer first.'); return; }
+      importSendAnswer(q, ta.value, msg, [send, ta]);
+    });
+    card.append(ta, el('div', { class: 'btn-row' }, send));
   }
-  const con = report.contract;
-  if (con) {
-    card.append(importExpandable('Dry-run contract flags', (con.flags || []).length, () =>
-      importObjTable(con.flags, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Rule' }, { key: 'spec', label: 'Spec' }, { key: 'message', label: 'Message' }])));
-  }
-  card.append(importExpandable('Sparse penders (no payment schedule)', ((report.penders || {}).sparse || []).length, () =>
-    importObjTable((report.penders || {}).sparse, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Status' }])));
-
-  card.append(el('div', { style: 'margin-top:10px' }, importReconciliation(report.listing_reconciliation)));
-  card.append(el('div', { style: 'margin-top:12px' }, importReportLink(reportUrl, reportStatus, purgedAt)));
-  card.append(importExpandable('Dry-run report (as approved)', 1, () => importRenderReport(report), { plain: 'The full report the import was approved on.', countText: 'expand' }));
-  if (report.finished_at) card.append(el('p', { class: 'muted small', style: 'margin-top:8px', text: 'Finished ' + fmtDateTime(report.finished_at) + '.' }));
+  card.append(msg);
   return card;
 }
 
-// ---- actions: approve / abort / purge ------------------------------------------------
-function importActionsCard(job, email, purgedAt) {
+async function importSendAnswer(q, answer, msgEl, controls) {
+  if (q._preview) { toast('ok', 'Preview only: nothing was sent.'); return; }
+  const d = IMP.detail;
+  for (const c of controls) c.disabled = true;
+  setMsg(msgEl, 'info', 'Sending…');
+  try {
+    await adminApi('answer_import_question', { question_id: q.id, answer });
+    if (d) { delete d.drafts[q.id]; delete d.msgs[q.id]; }
+    toast('ok', 'Sent. The import continues within about 10 seconds.');
+    await importRefreshDetail();
+  } catch (e) {
+    if (e.handled) return;
+    const text = e.code === 'already_answered' ? 'Already answered, by another admin or a moment ago. Refreshing.'
+      : e.code === 'invalid_answer' ? 'Not accepted: ' + e.message
+        : e.code === 'job_terminal' ? 'This import has already ended. Refreshing.'
+          : e.code === 'question_not_found' ? 'This question is gone (the runner restarted and asks again). Refreshing.'
+            : e.message;
+    if (d) d.msgs[q.id] = text;
+    setMsg(msgEl, 'err', text);
+    for (const c of controls) c.disabled = false;
+    if (['already_answered', 'job_terminal', 'question_not_found'].includes(e.code)) importRefreshDetail();
+  }
+}
+
+// One plain sentence per decision. q may be an answered import_questions row, or a bare
+// {kind, key, answer} from the report (no payload, no who/when).
+function importDecisionSentence(q, rep) {
+  const pl = q.payload || {};
+  const key = pl.key != null ? String(pl.key) : String(q.key);
+  const a = q.answer;
+  let answer = a;
+  let label = null;
+  if (Array.isArray(q.options)) {
+    const o = q.options.find((x) => x && x.key === a);
+    if (o) label = String(o.label || o.key);
+  }
+  if (a && typeof a === 'object') answer = a.redacted || a.consumed ? 'consumed' : JSON.stringify(a);
+  return importQ(q.kind).done(key, answer, pl, rep, label);
+}
+
+function importAnsweredQuestion(q, rep) {
+  return el('div', { class: 'q-sentence' },
+    el('span', { text: importDecisionSentence(q, rep) }),
+    q.answered_at ? el('span', { class: 'muted small' }, ' · ' + (q.answered_by_email || 'someone') + ', ', relTimeEl(q.answered_at)) : null);
+}
+
+// The "Your decisions this run" list: answered questions (with who/when) first, then any
+// decision the report carries that no question row explains (an older run).
+function importDecisionsList(report, questions, rep) {
+  const answered = (questions || []).filter((q) => q.answered_at);
+  const seen = new Set(answered.map((q) => q.kind + ' ' + (q.payload && q.payload.key)));
+  const extra = (report && Array.isArray(report.decisions) ? report.decisions : []).filter((x) => !seen.has(x.kind + ' ' + x.key));
+  const items = answered.map((q) => importAnsweredQuestion(q, rep))
+    .concat(extra.map((x) => el('div', { class: 'q-sentence' }, el('span', { text: importDecisionSentence(x, rep) }))));
+  return items;
+}
+
+// ---- word maps for the review and done screens ------------------------------------------
+const IMPORT_RULE_WORDS = {
+  cancel_reason_iff_cancelled: ['A cancelled deal has a cancel reason, and only a cancelled deal has one.', 'cancel reason and cancelled flag disagree'],
+  cancel_reason_enum: ['Every cancel reason is one the app knows.', 'unknown cancel reason'],
+  nonpender_is_earned: ['A deal paid in full at signing counts as earned.', 'paid in full at signing but not counted earned'],
+  pending_requires_pender: ['Only a financed deal can be pending.', 'pending but not financed'],
+  unpaid_pender_is_cancelled: ['A financed deal that never finished its down payment is marked cancelled.', 'never paid its down payment but not marked cancelled'],
+  commission_source_enum: ['Every commission says where its number came from.', 'commission has no known origin'],
+  computed_amount_matches: ['Every estimated commission equals volume times rate.', 'estimated commission is not volume times rate'],
+  upgrade_existing_owner_null: ['An upgrade never carries the existing-owner mark.', 'an upgrade carrying the existing-owner mark'],
+  volume_and_rate_positive: ['Volume and rate are both above zero.', 'volume or rate is zero'],
+  required_fields_present: ['Every deal has its account, date, owner and every required field.', 'a required field is missing'],
+  pender_has_final_payment_date: ['Every financed deal has a final payment date.', 'no final payment date'],
+  volume_derivation_consistent: ['The volume matches the price the app derives it from.', 'volume does not match its price'],
+  unpaid_is_terminal: ['A never-paid financed deal is truly dead, not still open.', 'marked never-paid while it may still be open'],
+};
+const importRuleWords = (name) => (IMPORT_RULE_WORDS[name] ? IMPORT_RULE_WORDS[name][0] : humanize(name));
+const importRuleFail = (name) => (IMPORT_RULE_WORDS[name] ? IMPORT_RULE_WORDS[name][1] : humanize(name));
+
+// Report-only classes (deals Westgate paid on that this import does not carry), in plain words.
+function importRoWords(rep, targeted) {
+  return {
+    already_on_account: ['Already in ' + rep + '’s book', targeted ? 'Left as they are.' : rep + ' entered these before the import. Westgate’s paid amounts are not on them yet.'],
+    absent_from_listing: ['Not in the sales report', 'Paid, but the sales report does not list them. A targeted import adds them.'],
+    excluded_by_gate: ['Not a deal we import', 'Not a sale, or no volume.'],
+    split_shell: ['Split payments on deals already counted', 'Paperwork twins of imported deals.'],
+    could_not_scrape: ['Not on the dashboard', 'Listed with the deals to enter by hand.'],
+    operator_skipped: ['Left out by your answer', 'You chose to leave these out.'],
+    not_targeted: ['Outside this run’s account list', 'A full import picks them up.'],
+    unclassified: ['Unexplained', 'We could not say why these are missing. Do not approve until this is understood.'],
+    unknown: ['Unexplained', 'We could not say why these are missing. Do not approve until this is understood.'],
+    legacy: ['Paid on, but not matched to a deal', 'This run predates the per-deal explanation. The full text report has the details.'],
+  };
+}
+const IMPORT_RO_ORDER = ['already_on_account', 'absent_from_listing', 'excluded_by_gate', 'split_shell', 'could_not_scrape', 'operator_skipped', 'not_targeted', 'unclassified', 'unknown', 'legacy'];
+// Older reports carry no class at all: never call those "unexplained".
+const importRoClass = (x) => (x.class === undefined || x.class === null ? 'legacy' : (x.class || 'unknown'));
+const importJobTargeted = (job) => !!(job && job.params && Array.isArray(job.params.accounts) && job.params.accounts.length);
+// The paid state of a report-only row from its report status (the row carries no facts block).
+function importRoPaid(row) {
+  const st = String(row.status || row.bucket || '');
+  if (/^IMPORT/.test(st)) return { state: 'paid', amount: row.amount, rate: null };
+  if (/pending/i.test(st)) return { state: 'pending', amount: row.amount, rate: null };
+  if (/notpaid/i.test(st)) return { state: 'not_paid', amount: row.amount, rate: null };
+  if (/CHARGEBACK/i.test(st)) return { state: 'chargeback', amount: row.amount, rate: null };
+  if (/REVIEW/i.test(st)) return { state: 'review', amount: null, rate: null };
+  return { state: row.amount != null ? 'paid' : 'review', amount: row.amount, rate: null };
+}
+function importShellOutcome(row) {
+  const r = String(row.reason || '');
+  if (/own deal/i.test(r)) return 'to enter by hand as its own deal';
+  if (/left unassigned/i.test(r)) return 'left out';
+  if (/fold/i.test(r)) return 'added to the kept deal';
+  if (/awaiting/i.test(r)) return 'waiting on your answer';
+  const m = /split sibling of (\d+)/i.exec(r);
+  return m ? 'twin of ' + m[1] : '';
+}
+function importRoTable(rows, cls) {
+  const cols = [{ label: 'Account' }, { label: 'Westgate paid' }];
+  if (cls === 'split_shell') cols.push({ label: 'Outcome' });
+  if (cls === 'excluded_by_gate') cols.push({ label: 'Why' });
+  return buildTable(cols, rows.map((x) => {
+    const cells = [el('span', { class: 'mono-sm', text: String(x.account) }), importPaidWords(importRoPaid(x))];
+    if (cls === 'split_shell') cells.push(importShellOutcome(x));
+    if (cls === 'excluded_by_gate') cells.push(importGateWords(x.reason));
+    return { cells };
+  }), { noCollapse: true });
+}
+function importGateWords(reason) {
+  const r = String(reason || '');
+  const bits = [];
+  if (/Sale=N/.test(r)) bits.push('not a sale');
+  if (/\$0 gross/.test(r)) bits.push('no volume');
+  if (/negative gross/.test(r)) bits.push('negative volume');
+  if (/type E/.test(r)) bits.push('not a sale type we import');
+  return bits.join(', ') || 'not a sale, or no volume';
+}
+
+// "Deals Westgate paid on that aren't in this import": one expandable per class, plain words.
+function importReportOnlySection(cm, rep, opts = {}) {
+  const wrap = el('div', {});
+  const rows = cm && Array.isArray(cm.report_only) ? cm.report_only : [];
+  const words = importRoWords(rep, opts.targeted);
+  for (const cls of IMPORT_RO_ORDER) {
+    const mine = rows.filter((x) => importRoClass(x) === cls);
+    if (!mine.length) continue;
+    const bad = cls === 'unclassified' || cls === 'unknown';
+    wrap.append(importExpandable(words[cls][0], mine.length, () => importRoTable(mine, cls),
+      { plain: words[cls][1], badge: bad ? severityBadge('error') : null }));
+  }
+  if (!rows.length) wrap.append(el('p', { class: 'muted small', text: opts.emptyText || 'None. Every deal Westgate paid on is in this import.' }));
+  return wrap;
+}
+
+function importReconWords(rep) {
+  return {
+    imported: 'Imported',
+    excluded_by_gate: 'Not a sale, or no volume',
+    excluded_D: 'Paperwork rows, not sales',
+    already_on_account: 'Already in ' + rep + '’s book',
+    operator_skipped: 'Left out by your answer',
+    could_not_scrape: 'Not on the dashboard',
+    not_targeted: 'Outside this run’s account list',
+    unparsed: 'Lines we could not read (skipped by your answer)',
+  };
+}
+// "Every row of the sales report, accounted for."
+function importReconciliation(lr, rep) {
+  const wrap = el('div', {});
+  if (!lr) {
+    wrap.append(el('p', { class: 'muted small', text: 'This run predates the row-by-row check.' }));
+    return wrap;
+  }
+  const lost = Array.isArray(lr.unaccounted) ? lr.unaccounted : [];
+  if (!lr.complete || !lr.tie_out || lost.length) {
+    const n = lost.length || '?';
+    wrap.append(el('div', { class: 'callout callout-danger' }, el('div', { class: 'callout-body' },
+      el('strong', { text: 'STOP: we lost track of ' + (lost.length ? intFmt(n) + (lost.length === 1 ? ' row' : ' rows') : 'some rows') + ', do not approve' }),
+      lost.length ? el('p', { class: 'mono-sm', text: lost.join(', ') }) : el('p', { class: 'small', text: 'The row counts do not add up to the report.' }))));
+  } else {
+    wrap.append(el('p', { class: 'msg msg-ok', style: 'margin:0 0 8px', text: 'All ' + intFmt(lr.total_rows) + ' rows accounted for.' }));
+  }
+  const words = importReconWords(rep);
+  const counts = lr.counts || {};
+  const b = lr.buckets || {};
+  const listCols = {
+    excluded_by_gate: [{ key: 'account', label: 'Account' }, { key: 'flags', label: 'Why', fmt: (f) => importGateWords(Array.isArray(f) ? f.join(' ') : f) }],
+    excluded_D: [{ key: 'account', label: 'Account' }, { key: 'money_bearing', label: 'Carries money' }],
+    already_on_account: [{ key: 'account', label: 'Account' }],
+    operator_skipped: [{ key: 'account', label: 'Account' }],
+    could_not_scrape: [{ key: 'account', label: 'Account' }, { key: 'reason', label: 'What the dashboard said' }],
+    not_targeted: [{ key: 'account', label: 'Account' }],
+    unparsed: [{ key: 'line', label: 'Line', cls: 'num' }],
+  };
+  const rows = Object.keys(words).filter((k) => counts[k]).map((k) => ({
+    cells: [words[k], intFmt(counts[k]), listCols[k] && Array.isArray(b[k]) && b[k].length
+      ? el('button', { class: 'btn-link', onclick: (e) => {
+        const tr = e.target.closest('tr');
+        if (tr.nextSibling && tr.nextSibling.classList && tr.nextSibling.classList.contains('imp-sub')) { tr.nextSibling.remove(); return; }
+        const sub = el('tr', { class: 'imp-sub' }, el('td', { colspan: '3' }, importObjTable(b[k], listCols[k])));
+        tr.after(sub);
+      } }, 'show')
+      : ''],
+  }));
+  wrap.append(buildTable([{ label: 'Where each row went' }, { label: 'Rows', cls: 'num' }, { label: '' }], rows, { noCollapse: true }));
+  if (lr.imported_pdf_absent && lr.imported_pdf_absent.length) {
+    wrap.append(el('p', { class: 'muted small', style: 'margin-top:6px', text: 'Plus ' + intFmt(lr.imported_pdf_absent.length) + ' imported from the dashboard alone (not in the sales report): ' + lr.imported_pdf_absent.join(', ') }));
+  }
+  if (lr.report_groups && !lr.report_groups.tie_out) {
+    wrap.append(el('p', { class: 'msg msg-err', style: 'margin-top:8px', text: 'STOP: the commission report’s rows do not all add up. Do not approve.' }));
+  }
+  return wrap;
+}
+
+// The "things to glance at" list shared by the review and done screens: [{title, count, build}].
+function importGlanceItems(r, rep) {
+  const items = [];
+  const cm = r.commission || {};
+  const xc = cm.cross_checks || {};
+  const con = r.contract || {};
+  const pend = r.penders || {};
+  const san = r.sanity || {};
+  const flagWords = (flags) => (Array.isArray(flags) ? flags : []).map((f) => f === 'multi-rate' ? 'paid in more than one line' : f === 'amount-vs-volume' ? 'amount does not match the report’s volume' : f === 'kept-earned' ? 'you counted it earned' : /^kept-advance/.test(f) ? 'an advance was kept on a never-paid deal' : String(f)).join('; ');
+  const flagged = (cm.imported && Array.isArray(cm.imported.rows) ? cm.imported.rows : []).filter((x) => Array.isArray(x.flags) && x.flags.length);
+  const add = (title, rows, cols, plain) => { if (rows && rows.length) items.push({ title, count: rows.length, build: () => importObjTable(rows, cols), plain }); };
+  add('Paid amounts worth a second look', flagged, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'imported_amount', label: 'Westgate paid', cls: 'num' }, { key: 'computed_amount', label: 'Standard rate would be', cls: 'num' }, { key: 'flags', label: 'Why', fmt: flagWords }],
+    'The paid amount is on the deal. The note is for you to chase with accounting.');
+  add('Westgate charged back these deals', cm.chargeback_review, [{ key: 'account', label: 'Account' }, { key: 'suggested_amount', label: 'Net on the report', cls: 'num' }, { key: 'cancelled', label: 'Cancelled' }],
+    'Not imported with a paid amount. Check each by hand.');
+  add('Paid by Westgate, but the paperwork says cancelled', xc.import_but_cancelled, [{ key: 'account', label: 'Account' }, { key: 'report_amount', label: 'Westgate paid', cls: 'num' }, { key: 'cancel_reason', label: 'Cancel reason', fmt: (v) => v === 'unpaid_pender' ? 'down payment never finished' : v === 'rescission' ? 'customer rescinded' : (v || '—') }],
+    'Imported as cancelled with no commission.');
+  add('Looks earned, but Westgate has not paid', xc.skip_notpaid_earned, [{ key: 'account', label: 'Account' }, { key: 'computed_amount', label: 'Standard-rate estimate', cls: 'num' }, { key: 'rate', label: 'Rate', fmt: importPct }],
+    'Shown at the standard rate until a commission report pays them.');
+  add('Volume on the commission report differs', xc.volume_mismatch, [{ key: 'account', label: 'Account' }, { key: 'deal_volume', label: 'Deal volume', cls: 'num' }, { key: 'report_volume', label: 'Report volume', cls: 'num' }],
+    'The deal keeps the dashboard’s volume and Westgate’s paid amount.');
+  add('Paid at an existing-owner rate', xc.existing_owner_rate, [{ key: 'account', label: 'Account' }, { key: 'rate', label: 'Rate', fmt: importPct }, { key: 'deal_date', label: 'Date' }],
+    'The paid rate matches an existing-owner rate, so the deal is marked that way.');
+  add('Not paid yet, but the report shows a rate', cm.rate_from_report, [{ key: 'account', label: 'Account' }, { key: 'rate', label: 'Report rate', fmt: importPct }, { key: 'amount_before', label: 'Standard rate', cls: 'num' }, { key: 'amount_after', label: 'At the report rate', cls: 'num' }],
+    'That rate is used. The amount is still an estimate until Westgate pays.');
+  add('Cancelled on paper, kept as earned by your answer', cm.kept_earned, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Westgate status' }, { key: 'paid_amount', label: 'Westgate paid', cls: 'num' }, { key: 'by', label: 'Decided by' }]);
+  add('Westgate’s payment overruled the paperwork', cm.arbitrated, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Westgate status' }, { key: 'new_state', label: 'Now counted as' }]);
+  add('Cancels close to the 90-day line', r.borderline, [{ key: 'account', label: 'Account' }, { key: 'gap', label: 'Days', cls: 'num' }, { key: 'call', label: 'Counted as', fmt: (v) => /cancel/i.test(String(v)) ? 'cancelled within 90 days' : 'a later default' }],
+    'A cancel inside 90 days is a bad trade with no commission; later is a default the rep keeps. These sit near the line.');
+  add('Data check notes', con.flags, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'Note', fmt: importRuleFail }],
+    'Imported anyway; these never block.');
+  add('Financed deals with no payment schedule', pend.sparse, [{ key: 'account', label: 'Account' }, { key: 'status_desc', label: 'Westgate status' }],
+    'The dashboard shows no payment plan, so the final payment date is unknown.');
+  if (Array.isArray(san.zero_volume) && san.zero_volume.length) items.push({ title: 'Deals with no volume', count: san.zero_volume.length, build: () => el('p', { class: 'mono-sm', text: san.zero_volume.join(', ') }) });
+  if (Array.isArray(san.empty_owners) && san.empty_owners.length) items.push({ title: 'Deals with no owner', count: san.empty_owners.length, build: () => el('p', { class: 'mono-sm', text: san.empty_owners.join(', ') }) });
+  return items;
+}
+function importGlanceList(items) {
+  if (!items.length) return el('p', { class: 'muted small', text: 'Nothing. Every deal looks the way the paperwork says.' });
+  return el('div', {}, items.map((it) => importExpandable(it.title, it.count, it.build, { plain: it.plain })));
+}
+
+// ---- the four bands (review and done share them) ---------------------------------------
+// DONE (green): what the import took care of. NEEDS YOUR ATTENTION (amber, open, highlighted):
+// only what leaves the book inexact. WORTH A GLANCE (grey, closed): optional reading, never a
+// thing left. FYI (grey): estimates, decisions, the full report.
+function importBand(kind, title, countText, body, opts = {}) {
+  const open = !!opts.open;
+  const bodyEl = el('div', { class: 'imp-band-body' + (open ? '' : ' hidden') }, body);
+  const chev = el('span', { class: 'imp-band-chev', text: open ? '▾' : '▸' });
+  const head = el('button', { class: 'imp-band-head', type: 'button' },
+    el('span', { text: title }), el('span', { class: 'imp-band-count', text: countText }), chev);
+  head.addEventListener('click', () => { bodyEl.classList.toggle('hidden'); chev.textContent = bodyEl.classList.contains('hidden') ? '▸' : '▾'; });
+  return el('div', { class: 'imp-band imp-band-' + kind }, head, bodyEl);
+}
+
+// One short line, with an optional list behind "Show".
+function importBullet(text, buildList, opts = {}) {
+  const li = el('li', { class: opts.cls || null });
+  li.append(el('span', { text: text }));
+  if (buildList) {
+    const holder = el('div', { class: 'imp-show-body hidden' });
+    let built = false;
+    const btn = el('button', { class: 'btn-link', type: 'button' }, 'Show');
+    btn.addEventListener('click', () => {
+      if (!built) { holder.append(buildList()); built = true; }
+      holder.classList.toggle('hidden');
+      btn.textContent = holder.classList.contains('hidden') ? 'Show' : 'Hide';
+    });
+    li.append(' ', btn, holder);
+  }
+  if (opts.actions && opts.actions.length) li.append(el('div', { class: 'btn-row' }, opts.actions));
+  return li;
+}
+const importPlural = (n, one, many) => intFmt(n) + ' ' + (n === 1 ? one : many);
+
+// The page line: "<Rep>'s book: N deals. This import added K." (the roster's current count when
+// it is loaded; otherwise the import's own numbers).
+function importHeadline(screen, k, verb) {
+  const roster = (C.users || []).find((u) => u.user_id === screen.job.target_user_id);
+  const book = roster && typeof roster.deal_count === 'number' ? roster.deal_count : null;
+  if (book == null) return el('p', { class: 'imp-lead', text: 'This import ' + verb + ' ' + importPlural(k, 'deal', 'deals') + ' to ' + screen.rep + '’s book.' });
+  return el('p', { class: 'imp-lead', text: screen.rep + '’s book: ' + importPlural(book, 'deal', 'deals') + '. This import ' + verb + ' ' + intFmt(k) + '.' });
+}
+
+// Numbers shared by both screens.
+function importReportNumbers(r) {
+  const cm = r.commission || null;
+  const lr = r.listing_reconciliation || null;
+  const counts = r.counts || {};
+  const rc = lr && lr.counts ? lr.counts : {};
+  const rob = cm && cm.report_only_by_class ? cm.report_only_by_class : {};
+  const alreadyN = rc.already_on_account != null ? rc.already_on_account : (rob.already_on_account || 0);
+  const paperworkN = (rc.excluded_by_gate || 0) + (rc.excluded_D || 0) + (rc.unparsed || 0) + (lr ? 0 : (r.excluded_d || []).length);
+  const rules = r.contract && Array.isArray(r.contract.by_rule) ? r.contract.by_rule : [];
+  const failedRules = rules.filter((x) => x.severity !== 'flag' && x.fail > 0);
+  const left = cm && cm.left_computed ? cm.left_computed : {};
+  const leftN = (left.skip_notpaid || 0) + (left.skip_pending || 0) + (left.zero_rate || 0) + (left.missing_from_report || 0);
+  const ro = cm && Array.isArray(cm.report_only) ? cm.report_only : [];
+  return {
+    cm, lr, counts, alreadyN, paperworkN, rules, failedRules, leftN, ro,
+    unexplained: ro.filter((x) => importRoClass(x) === 'unclassified' || importRoClass(x) === 'unknown'),
+    absent: ro.filter((x) => importRoClass(x) === 'absent_from_listing').map((x) => String(x.account)),
+    preEntered: ro.filter((x) => importRoClass(x) === 'already_on_account'),
+    leftShells: ro.filter((x) => importRoClass(x) === 'split_shell' && /left unassigned/i.test(String(x.reason || ''))),
+    tombN: Array.isArray(r.tombstones) ? r.tombstones.length : 0,
+    foldedN: cm && Array.isArray(cm.folded) ? cm.folded.length : 0,
+    flaggedN: cm && Array.isArray(cm.flagged_shells) ? cm.flagged_shells.length : 0,
+  };
+}
+
+// DONE bullets, shared: `will` = true on the review (future tense).
+function importDoneBullets(r, screen, will, extra) {
+  const n = importReportNumbers(r);
+  const rep = screen.rep;
+  const cm = n.cm;
+  const ul = el('ul', { class: 'imp-bullets' });
+  const c = n.counts;
+  const breakdown = intFmt(c.earned) + ' earned, ' + intFmt(c.pending) + ' pending, ' + intFmt(c.cancelled) + ' cancelled';
+  if (extra && extra.importedLine) ul.append(extra.importedLine);
+  else ul.append(importBullet((will ? 'Will import ' : 'Imported ') + importPlural(c.total || 0, 'deal', 'deals') + ': ' + breakdown + '.'));
+  if (cm) {
+    const imp = cm.imported || {};
+    ul.append(importBullet((will ? 'Applies' : 'Applied') + ' Westgate’s paid amounts to ' + importPlural(imp.count || 0, 'deal', 'deals') + ', ' + money(imp.total) + '.',
+      (imp.rows || []).length ? () => importObjTable(imp.rows, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'imported_amount', label: 'Westgate paid', cls: 'num' }, { key: 'imported_rate', label: 'Rate', fmt: importPct }, { key: 'computed_amount', label: 'Standard rate would be', cls: 'num' }]) : null));
+  }
+  if (n.alreadyN) {
+    const list = n.lr && n.lr.buckets && Array.isArray(n.lr.buckets.already_on_account) && n.lr.buckets.already_on_account.length ? n.lr.buckets.already_on_account : null;
+    ul.append(importBullet((will ? 'Leaves ' : 'Left ') + importPlural(n.alreadyN, 'deal', 'deals') + ' already in the app as ' + (n.alreadyN === 1 ? 'it is.' : 'they are.'),
+      list ? () => importObjTable(list, [{ key: 'account', label: 'Account' }]) : null));
+  }
+  if (n.paperworkN) {
+    const b = n.lr && n.lr.buckets ? n.lr.buckets : {};
+    ul.append(importBullet((will ? 'Skips ' : 'Skipped ') + importPlural(n.paperworkN, 'row', 'rows') + ' that ' + (n.paperworkN === 1 ? 'is not a sale.' : 'are not sales.'), () => el('div', {},
+      (b.excluded_by_gate || []).length ? importObjTable(b.excluded_by_gate, [{ key: 'account', label: 'Account' }, { key: 'flags', label: 'Why', fmt: (f) => importGateWords(Array.isArray(f) ? f.join(' ') : f) }]) : null,
+      (b.excluded_D || []).length ? importObjTable(b.excluded_D, [{ key: 'account', label: 'Paperwork row' }, { key: 'money_bearing', label: 'Carries money' }]) : null,
+      (b.unparsed || []).length ? importObjTable(b.unparsed, [{ key: 'line', label: 'Line we could not read', cls: 'num' }]) : null,
+      !n.lr && (r.excluded_d || []).length ? importObjTable(r.excluded_d, [{ key: 'account', label: 'Paperwork row' }, { key: 'date', label: 'Date' }, { key: 'volume', label: 'Volume', cls: 'num' }]) : null)));
+  }
+  if (n.foldedN || n.flaggedN) {
+    ul.append(importBullet((will ? 'Folds ' : 'Folded ') + importPlural(n.foldedN + n.flaggedN, 'split payment', 'split payments') + ' into ' + (n.foldedN + n.flaggedN === 1 ? 'its deal' : 'their deals') + (n.flaggedN ? ', ' + intFmt(n.flaggedN) + ' flagged for a glance.' : '.'), () => el('div', {},
+      n.foldedN ? importObjTable(cm.folded.map((f) => ({ kept_account: f.kept_account, shells: f.shells.map((s) => s.account + ' ' + money(s.amount)).join(', '), sum: f.sum })), [{ key: 'kept_account', label: 'Deal' }, { key: 'shells', label: 'Payments added' }, { key: 'sum', label: 'Commission now', cls: 'num' }]) : null,
+      n.flaggedN ? importObjTable(cm.flagged_shells, [{ key: 'kept_account', label: 'Deal' }, { key: 'account', label: 'Payment on' }, { key: 'amount', label: 'Added', cls: 'num' }, { key: 'implied_rate', label: 'Rate it implies', fmt: importPct }]) : null)));
+  }
+  if (n.tombN) {
+    ul.append(importBullet((will ? 'Records ' : 'Recorded ') + importPlural(n.tombN, 'never-paid deal', 'never-paid deals') + ' as cancelled at $0, so the book stays complete.',
+      () => importObjTable(r.tombstones, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'deal_date', label: 'Date' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'amount', label: 'Would have paid', cls: 'num' }])));
+  }
+  if (n.lr && n.lr.complete && n.lr.tie_out && !(n.lr.unaccounted || []).length) {
+    ul.append(importBullet('Every one of the ' + intFmt(n.lr.total_rows) + ' sales-report rows is accounted for.', () => importReconciliation(n.lr, rep)));
+  }
+  if (n.rules.length && !n.failedRules.length) {
+    const post = r.post_contract;
+    ul.append(importBullet('Passed ' + intFmt(n.rules.length) + ' of ' + intFmt(n.rules.length) + ' data checks' + (post && post.ok === true ? ' on every landed deal.' : '.'),
+      () => buildTable([{ label: 'Check' }, { label: 'Result' }], n.rules.map((x) => ({ cells: [importRuleWords(x.name), x.fail > 0 ? intFmt(x.fail) + ' worth a glance' : 'passed'] })), { noCollapse: true })));
+  }
+  return ul;
+}
+
+// STOP items shared by both screens (each leaves the book inexact or blocks the import).
+function importStopItems(r, screen, isDone) {
+  const n = importReportNumbers(r);
+  const items = [];
+  const stop = (line, body) => items.push({ line, body, stop: true });
+  if (n.lr && (!n.lr.complete || !n.lr.tie_out || (n.lr.unaccounted || []).length)) {
+    const lost = n.lr.unaccounted || [];
+    stop('STOP: we lost track of ' + (lost.length ? importPlural(lost.length, 'row', 'rows') : 'some rows') + ', do not approve.', lost.length ? el('p', { class: 'mono-sm', text: lost.join(', ') }) : null);
+  }
+  if (n.failedRules.length && r.contract) {
+    const v = r.contract.violations || [];
+    stop('STOP: ' + importPlural(v.length, 'deal fails', 'deals fail') + ' a data check. The import will be refused.', importObjTable(v, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'What failed', fmt: importRuleFail }]));
+  }
+  const pc = r.post_contract;
+  if (isDone && pc && pc.ok === false) {
+    stop('STOP: ' + importPlural((pc.violations || []).length, 'deal landed', 'deals landed') + ' with a data problem. Open each from Users and correct it.', importObjTable(pc.violations || [], [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'What failed', fmt: importRuleFail }]));
+  } else if (isDone && pc && pc.ok === null) {
+    stop('STOP: could not re-check what landed. Run the integrity check for ' + screen.rep + '.', null);
+  }
+  if (n.cm && n.cm.parse && n.cm.parse.self_validation_pass === false) stop('STOP: the commission report’s lines do not add up to its total.', null);
+  if (n.lr && n.lr.report_groups && n.lr.report_groups.tie_out === false) stop('STOP: the commission report’s rows do not all add up.', null);
+  if (r.employee_guard && r.employee_guard.status && r.employee_guard.status !== 'match') stop('STOP: the two PDFs belong to different reps.', null);
+  if (n.unexplained.length) stop('STOP: Westgate paid on ' + importPlural(n.unexplained.length, 'deal', 'deals') + ' we cannot explain.', importRoTable(n.unexplained, 'unknown'));
+  return items;
+}
+
+function importAttentionBody(items, emptyLine) {
+  if (!items.length) return el('p', { class: 'msg msg-ok', style: 'margin:0', text: emptyLine });
+  const ol = el('ol', { class: 'imp-todo' });
+  for (const it of items) {
+    const li = el('li', { class: it.stop ? 'imp-stop' : null }, el('div', { class: 'imp-todo-line', text: it.line }));
+    if (it.body) li.append(it.body);
+    if (it.actions && it.actions.length) li.append(el('div', { class: 'btn-row' }, it.actions));
+    ol.append(li);
+  }
+  return ol;
+}
+
+function importGlanceBand(r, screen) {
+  const items = importGlanceItems(r, screen.rep);
+  return importBand('glance', 'Worth a glance', importPlural(items.length, 'list', 'lists') + ', optional', importGlanceList(items));
+}
+
+// FYI lines shared by both screens; `more` are extra {text, build?} lines the caller adds.
+function importFyiBand(r, screen, more) {
+  const n = importReportNumbers(r);
+  const rep = screen.rep;
+  const ul = el('ul', { class: 'imp-bullets' });
+  if (!n.cm) ul.append(importBullet('No commission report was uploaded, so every commission is the standard-rate estimate.'));
+  else if (n.leftN) ul.append(importBullet(importPlural(n.leftN, 'deal', 'deals') + ' Westgate has not paid yet ' + (n.leftN === 1 ? 'shows' : 'show') + ' the standard-rate estimate. The next commission report updates ' + (n.leftN === 1 ? 'it.' : 'them.')));
+  for (const m of (more || [])) ul.append(importBullet(m.text, m.build || null, { actions: m.actions || null }));
+  const decisions = importDecisionsList(r, screen.questions, rep);
+  ul.append(importBullet('Your decisions this run: ' + intFmt(decisions.length) + '.', decisions.length ? () => el('div', { class: 'q-answers' }, decisions) : null));
+  if (n.ro.length) ul.append(importBullet('Deals Westgate paid on that are not in this import: ' + intFmt(n.ro.length) + '.', () => importReportOnlySection(n.cm, rep, { targeted: importJobTargeted(screen.job) })));
+  const extras = [
+    ['Recovered from the dashboard alone', r.pdf_absent, [{ key: 'account', label: 'Account' }]],
+    ['Sales split across contracts', r.split_groups, [{ key: 'accounts', label: 'Accounts' }, { key: 'asymmetry', label: 'Legs disagree' }]],
+    ['Asked for, but not a deal', r.targeted_excluded, [{ key: 'account', label: 'Account' }, { key: 'reasons', label: 'Why', fmt: (v) => (Array.isArray(v) ? v.map((x) => x === '$0-volume' ? 'no volume' : x === 'non-sale' ? 'not a sale' : x === 'type-E' ? 'not a sale type we import' : x).join(', ') : '—') }]],
+  ];
+  for (const [label, rows, cols] of extras) if (Array.isArray(rows) && rows.length) ul.append(importBullet(label + ': ' + intFmt(rows.length) + '.', () => importObjTable(rows, cols)));
+  const link = importReportLink(screen.reportUrl, screen.reportStatus, screen.purgedAt);
+  if (link) ul.append(el('li', {}, link));
+  if (r.finished_at) ul.append(importBullet('Finished ' + fmtDateTime(r.finished_at) + '.'));
+  return importBand('fyi', 'FYI', importPlural(ul.children.length, 'note', 'notes'), ul, { open: true });
+}
+
+// ---- the review -------------------------------------------------------------------------
+function importRenderReport(r, screen) {
+  const n = importReportNumbers(r);
+  const root = el('div', {});
+  root.append(importBand('done', 'Done', importPlural(n.counts.total || 0, 'deal', 'deals'), importDoneBullets(r, screen, true), { open: true }));
+
+  const items = importStopItems(r, screen, false);
+  const open = (screen.questions || []).filter((q) => !q.answered_at);
+  if (open.length) items.push({ line: importPlural(open.length, 'question', 'questions') + ' waiting for your answer.', body: el('div', {}, open.map((q) => importQuestionCard(q, IMP.detail || { drafts: {}, msgs: {} }, false, screen.rep))) });
+  root.append(importBand('attention', 'Needs your attention', String(items.length), importAttentionBody(items, 'Nothing. Ready to approve.'), { open: true }));
+
+  root.append(importGlanceBand(r, screen));
+
+  const more = [];
+  if ((r.could_not_scrape || []).length) more.push({ text: importPlural(r.could_not_scrape.length, 'deal', 'deals') + ' could not be pulled from the dashboard. After the import, enter ' + (r.could_not_scrape.length === 1 ? 'it' : 'them') + ' by hand.',
+    build: () => importObjTable(r.could_not_scrape, [{ key: 'account', label: 'Account' }, { key: 'owner', label: 'Owner' }, { key: 'deal_date', label: 'Date' }, { key: 'volume', label: 'Volume', cls: 'num' }, { key: 'report_amount', label: 'Westgate paid', cls: 'num' }, { key: 'reason', label: 'What the dashboard said' }]) });
+  if (n.absent.length) more.push({ text: importPlural(n.absent.length, 'deal', 'deals') + ' Westgate paid on ' + (n.absent.length === 1 ? 'is' : 'are') + ' not in the sales report. A targeted import after this one adds ' + (n.absent.length === 1 ? 'it.' : 'them.'), build: () => el('p', { class: 'mono-sm', text: n.absent.join(', ') }) });
+  root.append(importFyiBand(r, screen, more));
+  return root;
+}
+
+function importReviewCard(report, screen) {
   const card = el('div', { class: 'card' },
-    el('div', { class: 'card-title' }, el('h2', { text: 'Actions' }),
-      tip('Approve is only offered on the dry-run. Abort is offered until approval; once approved the runner must finish. Purge removes a finished job’s files from storage and keeps the record.')));
+    el('div', { class: 'card-title' }, el('h2', { text: 'Ready for your approval' }),
+      el('span', { class: 'badge badge-warning', text: 'nothing written yet' })));
+  if (!report) {
+    card.append(el('p', { class: 'msg msg-err', text: 'The report is still being written. Refresh in a moment.' }));
+    return card;
+  }
+  card.append(importHeadline(screen, (report.counts && report.counts.total) || 0, 'will add'));
+  card.append(importRenderReport(report, screen));
+  return card;
+}
+
+// ---- done ---------------------------------------------------------------------------------
+function importResultsCard(report, screen) {
+  const { rep, job } = screen;
+  const card = el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'Done' }), el('span', { class: 'badge badge-success', text: 'imported' })));
+  if (!report) {
+    card.append(el('p', { class: 'msg msg-err', text: 'The import finished but left no report.' }));
+    return card;
+  }
+  if (report.nothing_to_import) {
+    card.append(el('p', { class: 'imp-lead', text: 'Nothing to import: ' + rep + '’s book already had every deal in the report (' + intFmt(report.already_present) + ').' }));
+    card.append(importReportLink(screen.reportUrl, screen.reportStatus, screen.purgedAt));
+    return card;
+  }
+  const n = importReportNumbers(report);
+  const ins = report.insert || {};
+  const rec = report.reconcile || {};
+  const cm = n.cm;
+  card.append(importHeadline(screen, ins.inserted || 0, 'added'));
+
+  // 1. DONE
+  const c = n.counts;
+  const importedLine = importBullet('Imported ' + importPlural(ins.inserted || 0, 'deal', 'deals') + ': ' + intFmt(c.earned) + ' earned, ' + intFmt(c.pending) + ' pending, ' + intFmt(c.cancelled) + ' cancelled.' +
+    (ins.already_present ? ' ' + importPlural(ins.already_present, 'was', 'were') + ' already there and skipped.' : ''));
+  card.append(importBand('done', 'Done', importPlural(ins.inserted || 0, 'deal', 'deals'), importDoneBullets(report, screen, false, { importedLine }), { open: true }));
+
+  // 2. NEEDS YOUR ATTENTION
+  const items = importStopItems(report, screen, true);
+  const manual = Array.isArray(rec.manual_entry) ? rec.manual_entry.map(String) : [];
+  const byAcct = new Map((report.could_not_scrape || []).map((x) => [String(x.account), x]));
+  const manualRows = manual.map((a) => Object.assign({ account: a }, byAcct.get(a) || {}));
+  if (manualRows.length) {
+    const lines = manualRows.map((m) => [m.account, m.owner || '', m.deal_date ? fmtISODate(m.deal_date) : '', m.volume == null ? '' : money(m.volume), m.report_amount != null ? 'Westgate paid ' + money(m.report_amount) : ''].filter(Boolean).join(' · '));
+    items.push({
+      line: importPlural(manualRows.length, 'deal', 'deals') + ' we could not get from the dashboard.',
+      body: buildTable([{ label: 'Account' }, { label: 'Owner' }, { label: 'Date' }, { label: 'Volume', cls: 'num' }, { label: 'Westgate paid' }],
+        manualRows.map((m) => ({ cells: [el('span', { class: 'mono-sm', text: m.account }), m.owner || '—', m.deal_date ? fmtISODate(m.deal_date) : '—', m.volume == null ? '—' : money(m.volume), m.report_amount != null ? money(m.report_amount) : '—'] })), { noCollapse: true }),
+      actions: [
+        el('span', { class: 'row', style: 'gap:6px' }, el('button', { class: 'btn btn-small', disabled: true, title: 'Coming next' }, 'Import from the sales report'), el('span', { class: 'muted small', text: 'coming next' })),
+        el('button', { class: 'btn btn-small', onclick: () => importCopyText('Deals to add for ' + rep + ':\n' + lines.join('\n'), 'the list for ' + rep) }, 'Copy list for ' + rep),
+      ],
+    });
+  }
+  if (n.absent.length) {
+    items.push({
+      line: importPlural(n.absent.length, 'deal', 'deals') + ' Westgate paid on ' + (n.absent.length === 1 ? 'is' : 'are') + ' not in the sales report.',
+      body: el('p', { class: 'mono-sm', text: n.absent.join(', ') }),
+      actions: [importTargetedFollowUp(job, rep, n.absent)],
+    });
+  }
+  const preEntered = importJobTargeted(job) ? [] : n.preEntered;
+  if (preEntered.length) {
+    const total = preEntered.reduce((s, x) => s + (Number(x.amount) || 0), 0);
+    items.push({
+      line: importPlural(preEntered.length, 'deal', 'deals') + ' ' + rep + ' entered by hand may not match what Westgate paid, ' + money(total) + '. Reconcile: coming next.',
+      body: importRoTable(preEntered, 'already_on_account'),
+      actions: [el('button', { class: 'btn btn-small', onclick: () => importCopyText('Deals ' + rep + ' entered by hand, with what Westgate paid:\n' + preEntered.map((x) => x.account + ' · ' + importPaidWords(importRoPaid(x))).join('\n'), 'the list') }, 'Copy list')],
+    });
+  }
+  const shellLines = [];
+  for (const s of (rec.own_deal_shells || (cm && cm.own_deal_shells) || [])) shellLines.push(money(s.amount) + ' on ' + s.account + ': enter it by hand as its own deal.');
+  for (const s of n.leftShells) shellLines.push(money(s.amount) + ' on ' + s.account + ': left out by your answer.');
+  if (shellLines.length) {
+    items.push({
+      line: importPlural(shellLines.length, 'split payment', 'split payments') + ' not folded into any deal.',
+      body: el('ul', { class: 'imp-plain-list' }, shellLines.map((t) => el('li', { text: t }))),
+      actions: [el('button', { class: 'btn btn-small', onclick: () => importCopyText('Split payments for ' + rep + ':\n' + shellLines.join('\n'), 'the list') }, 'Copy list')],
+    });
+  }
+  card.append(importBand('attention', 'Needs your attention', String(items.length), importAttentionBody(items, 'Nothing. This book is exact.'), { open: true }));
+
+  // 3. WORTH A GLANCE
+  card.append(importGlanceBand(report, screen));
+
+  // 4. FYI
+  const more = [{ text: 'The report you approved.', build: () => importRenderReport(report, screen) }];
+  card.append(importFyiBand(report, screen, more));
+  return card;
+}
+
+// The "start a targeted import" affordance for deals paid on but missing from the sales report.
+function importTargetedFollowUp(job, rep, accounts) {
+  const btn = el('button', { class: 'btn btn-small btn-primary' }, 'Start a targeted import (' + intFmt(accounts.length) + ')');
+  btn.addEventListener('click', () => {
+    if (job._preview) { toast('ok', 'Preview only.'); return; }
+    IMP.create = importFreshCreate();
+    IMP.create.targetId = job.target_user_id;
+    IMP.create.accounts = accounts.join(', ');
+    IMP.create.note = 'Prefilled for ' + rep + ' with ' + intFmt(accounts.length) + (accounts.length === 1 ? ' deal' : ' deals') + ' Westgate paid on that the sales report does not list. Upload both PDFs again.';
+    nav('tools/import');
+  });
+  return btn;
+}
+
+// ---- failed ------------------------------------------------------------------------------
+const IMPORT_FAIL_WORDS = {
+  contract_violation: ['Some deals failed a data check, so nothing was written.', 'Fix the cause (often an answer to a question), then start a new import with the same PDFs.'],
+  insert_failed: ['Writing stopped partway. Some deals may already be on the book.', 'Start a new import with the same PDFs. Deals already on the book are skipped, never duplicated.'],
+  commission_parse_failed: ['The commission report could not be read. Nothing was written.', 'Export it again from Westgate and start a new import.'],
+  pdf_parse_failed: ['The sales report could not be read. Nothing was written.', 'Export it again from Westgate and start a new import.'],
+  pdf_missing: ['An uploaded PDF could not be opened. Nothing was written.', 'Upload it again in a new import.'],
+  scrape_no_session: ['The dashboard sign-in could not be refreshed. Nothing was written.', 'Start a new import. If the automatic sign-in fails again, the runner asks you for one.'],
+  no_session: ['No dashboard sign-in worked after three tries. Nothing was written.', 'Check the runner’s Westgate login, then start a new import.'],
+  scrape_incomplete: ['Some accounts could not be pulled from the dashboard. Nothing was written.', 'Start a new import; the runner asks what to do about them.'],
+  employee_mismatch: ['The two PDFs belong to different reps. Nothing was written.', 'Check the files and start a new import.'],
+  target_user_missing: ['The target account no longer exists.', 'Nothing to do.'],
+  resume_checkpoint_missing: ['The runner restarted mid-write and its saved plan was gone.', 'Check what landed on the book before starting a new import.'],
+  job_state_lost: ['The job changed under the runner.', 'Check the book, then start a new import if needed.'],
+  db_read_failed: ['The database could not be read. Nothing was written.', 'Start a new import.'],
+  runner_crash: ['The runner hit an unexpected error.', 'Start a new import. If it happens again, the runner’s logs have the cause.'],
+  runner_bug: ['The runner hit an unexpected error.', 'Start a new import. If it happens again, the runner’s logs have the cause.'],
+};
+const IMPORT_FAIL_DEFAULT_WORDS = ['This import stopped.', 'Nothing is written before approval. Start a new import with the same PDFs.'];
+
+function importFailedCard(job, report, screen) {
+  const rep = screen.rep;
+  const words = IMPORT_FAIL_WORDS[job.error_code] || IMPORT_FAIL_DEFAULT_WORDS;
+  const v = report && report.contract && Array.isArray(report.contract.violations) ? report.contract.violations : [];
+  const body = el('div', { class: 'callout-body' },
+    el('strong', { text: 'This import failed. ' + words[0] }),
+    v.length ? el('div', { style: 'margin-top:8px' },
+      el('p', { class: 'small strong', text: intFmt(v.length) + (v.length === 1 ? ' deal was refused:' : ' deals were refused:') }),
+      importObjTable(v, [{ key: 'account', label: 'Account' }, { key: 'rule', label: 'What failed', fmt: importRuleFail }])) : null,
+    el('p', { class: 'small', style: 'margin-top:8px' }, el('b', { text: 'What to do: ' }), words[1]),
+    job.error_detail ? importExpandable('Technical detail (for the developer)', 1, () => el('pre', { class: 'imp-detail-pre', text: String(job.error_detail) }), { countText: 'show' }) : null);
+  return el('div', { class: 'callout callout-danger' }, body);
+}
+
+// ---- actions: approve / stop / purge ------------------------------------------------------
+function importActionsCard(job, screen) {
+  const { rep, email, purgedAt } = screen;
+  const card = el('div', { class: 'card' }, el('div', { class: 'card-title' }, el('h2', { text: 'Actions' })));
   const row = el('div', { class: 'btn-row' });
   const p = job.progress || {};
   const n = typeof p.counts === 'object' && p.counts && typeof p.counts.to_insert === 'number' ? p.counts.to_insert
     : (job.report && job.report.counts && typeof job.report.counts.total === 'number' ? job.report.counts.total : null);
+  const dealsWord = n == null ? 'these deals' : intFmt(n) + (n === 1 ? ' deal' : ' deals');
 
   if (job.status === 'awaiting_review') {
-    const approve = el('button', { class: 'btn btn-primary' }, '✓ Approve import…');
+    const approve = el('button', { class: 'btn btn-primary' }, '✓ Approve: import ' + dealsWord + ' for ' + rep);
     approve.addEventListener('click', () => {
+      if (job._preview) { toast('ok', 'Preview only: nothing was approved.'); return; }
       confirmModal({
-        title: 'Import ' + (n == null ? 'these deals' : intFmt(n) + ' deal(s)') + ' into ' + email + '?',
+        title: 'Import ' + dealsWord + ' into ' + rep + '’s book?',
         typed: 'IMPORT',
-        confirmLabel: 'Approve import',
+        confirmLabel: 'Approve',
         body: el('div', {},
-          el('p', { text: 'This inserts ' + (n == null ? 'the deals in the report' : intFmt(n) + ' deal(s)') + ' into ' + email + '. The runner starts writing immediately. Once approved, the import cannot be aborted, and it cannot be undone from here: every inserted deal would have to be deleted by hand.' }),
-          el('p', { text: 'Dedupe is re-checked at write time, so deals already on the account are skipped, and the runner re-reads what landed against the data-model contract afterwards.' })),
+          el('p', { text: 'Writing starts right away and cannot be stopped or undone from here. Deals already on the book are skipped.' })),
         onConfirm: async () => {
           try {
             await adminApi('approve_import_job', { job_id: job.id, confirm: 'IMPORT' });
@@ -3472,7 +3811,7 @@ function importActionsCard(job, email, purgedAt) {
             if (e.code === 'not_awaiting_review') { importRefreshDetail(); throw new Error(e.message); }
             throw e;
           }
-          toast('ok', 'Approved. The runner is inserting into ' + email + '.');
+          toast('ok', 'Approved. Writing ' + rep + '’s deals now.');
           importRefreshDetail();
         },
       });
@@ -3481,20 +3820,17 @@ function importActionsCard(job, email, purgedAt) {
   }
 
   if (IMPORT_ABORTABLE_STATUSES.includes(job.status)) {
-    const abort = el('button', { class: 'btn btn-danger-outline' }, '⏹ Abort…');
+    const abort = el('button', { class: 'btn btn-danger-outline' }, '⏹ Stop this import');
     abort.addEventListener('click', () => {
-      const why = job.status === 'queued'
-        ? 'Removes the job from the queue before the runner picks it up. Nothing has been written.'
-        : job.status === 'awaiting_review'
-          ? 'Discards the dry-run without inserting anything. Nothing has been written.'
-          : 'The runner stops at its next check: within about 30 seconds, or at the next account boundary during a scrape. Nothing has been written.';
+      if (job._preview) { toast('ok', 'Preview only.'); return; }
+      const why = job.status === 'queued' ? 'It is removed from the queue.'
+        : job.status === 'awaiting_review' ? 'The report is discarded.'
+          : 'The runner stops within about 30 seconds.';
       confirmModal({
-        title: 'Abort this import?',
+        title: 'Stop this import?',
         danger: true,
-        confirmLabel: 'Abort import',
-        body: el('div', {},
-          el('p', { text: why }),
-          el('p', { text: 'The uploaded PDFs and any report stay in storage until you purge the job. To try again, create a new import.' })),
+        confirmLabel: 'Stop it',
+        body: el('div', {}, el('p', { text: why + ' Nothing has been written to ' + rep + '’s book. To try again, start a new import.' })),
         onConfirm: async () => {
           try {
             await adminApi('abort_import_job', { job_id: job.id });
@@ -3502,32 +3838,31 @@ function importActionsCard(job, email, purgedAt) {
             if (e.code === 'not_abortable') { importRefreshDetail(); throw new Error(e.message); }
             throw e;
           }
-          toast('ok', 'Abort sent.');
+          toast('ok', 'Stopping.');
           importRefreshDetail();
         },
       });
     });
     row.append(abort);
   } else if (job.status === 'approved' || job.status === 'inserting') {
-    row.append(el('span', { class: 'muted small', text: 'Approved imports cannot be aborted: the runner finishes the insert and reconciles what landed.' }));
+    row.append(el('span', { class: 'muted small', text: 'Writing has started and runs to the end.' }));
   }
 
   if (IMPORT_TERMINAL_STATUSES.includes(job.status)) {
     if (purgedAt) {
-      row.append(el('span', { class: 'muted small' }, 'Files purged ', relTimeEl(purgedAt), '.'));
+      row.append(el('span', { class: 'muted small' }, 'Files removed ', relTimeEl(purgedAt), '.'));
     } else {
-      const purge = el('button', { class: 'btn btn-danger-outline' }, '🗑 Purge files…');
+      const purge = el('button', { class: 'btn btn-danger-outline' }, '🗑 Remove the files');
       purge.addEventListener('click', () => {
+        if (job._preview) { toast('ok', 'Preview only.'); return; }
         confirmModal({
-          title: 'Purge this job’s files?',
+          title: 'Remove this import’s files?',
           danger: true,
-          confirmLabel: 'Purge files',
-          body: el('div', {},
-            el('p', { text: 'Deletes this job’s files from storage: the uploaded PDFs, report.txt, and any runner checkpoint. The job record, its questions, and the summary on this screen stay.' }),
-            el('p', { text: 'This cannot be undone. Nothing on the target account is touched.' })),
+          confirmLabel: 'Remove files',
+          body: el('div', {}, el('p', { text: 'Deletes the uploaded PDFs and the text report from storage. This page keeps its summary. ' + rep + '’s book is not touched. This cannot be undone.' })),
           onConfirm: async () => {
             const resp = await adminApi('purge_import_job', { job_id: job.id });
-            toast('ok', 'Purged ' + intFmt(resp && resp.deleted) + ' file(s).');
+            toast('ok', 'Removed ' + intFmt(resp && resp.deleted) + ' file(s).');
             importRefreshDetail();
           },
         });
@@ -3538,6 +3873,129 @@ function importActionsCard(job, email, purgedAt) {
   if (!row.childNodes.length) row.append(el('span', { class: 'muted small', text: 'Nothing to do right now.' }));
   card.append(row);
   return card;
+}
+
+// ---- preview: every screen from made-up data (#/tools/import/preview) ----------------------
+// Admin-gated like the whole panel; not linked from anywhere. Nothing here is real or sent.
+function importPreviewFixtures() {
+  const rep = 'Jane';
+  const email = 'jane.example@example.com';
+  const F = (over) => Object.assign({ account: '10000000001', owner: 'Pat Example', deal_date: '2025-03-14', volume: 24000, deal_type: 'new', financed: true,
+    status_desc: 'OPEN-OPEN-GOOD-ESCROW', in_sales_report: true, on_dashboard: true, paid: { state: 'paid', amount: 2400, rate: 10 } }, over || {});
+  const t = new Date(Date.now() - 3600 * 1000).toISOString();
+  const opt = (pairs) => pairs.map(([key, label]) => ({ key, label }));
+  const qs = [
+    { kind: 'division', payload: { key: 'CONCIERGE EXPERIENCES', context: { division: 'CONCIERGE EXPERIENCES', count: 14 }, rows: [F(), F({ account: '10000000002', owner: 'Sam Example', volume: 9000, deal_type: 'upgrade', financed: false, paid: { state: 'not_paid', amount: 540, rate: 6 } })], more: 12 },
+      options: opt([['OWNER REFERRAL', 'Owner Referral'], ['WESTGATE RESORTS MARKETING', 'Westgate Resorts Marketing'], ['V.O.A.', 'VOA'], ['IN HOUSE', 'In House'], ['MAILOUT', 'Mailout'], ['__RAW__', 'store raw as-is']]) },
+    { kind: 'status', payload: { key: 'CANCEL-MAILOUT', context: { status_desc: 'CANCEL-MAILOUT', count: 2 }, rows: [F({ status_desc: 'CANCEL-MAILOUT', paid: { state: 'not_paid', amount: 2400, rate: 10 } }), F({ account: '10000000003', owner: 'Lee Example', status_desc: 'CANCEL-MAILOUT', paid: { state: 'paid', amount: 1200, rate: 10 } })], more: 0 },
+      options: opt([['cancelled', 'cancelled (rep not paid)'], ['earned', 'earned (later default, rep keeps it)']]) },
+    { kind: 'mismatch', payload: { key: '10000000001', context: { account: '10000000001', volume: { pdf: 24000, dashboard: 22000, mismatch: true }, type: { pdf: 'N', dashboard: 'U', mismatch: true } }, facts: F() },
+      options: opt([['pdf', 'use PDF value'], ['dashboard', 'use dashboard value'], ['skip', 'skip this deal (do not import)']]) },
+    { kind: 'blocking', payload: { key: '10000000004', context: { account: '10000000004', reason: 'negative volume (-19000)' }, facts: F({ account: '10000000004', volume: -19000, deal_type: 'upgrade', paid: { state: 'unknown' } }) },
+      options: opt([['skip', 'skip this deal (do not import)'], ['abort', 'abort the run (I will investigate)']]) },
+    { kind: 'penderLiveness', payload: { key: 'PENDING-HOLD', context: { status_desc: 'PENDING-HOLD', count: 1 }, rows: [F({ status_desc: 'PENDING-HOLD', paid: { state: 'pending', amount: 1440, rate: 6 } })], more: 0 },
+      options: opt([['live', 'live open pender (pending, commission stands)'], ['terminal', 'terminal / unpaid (cancelled, $0)']]) },
+    { kind: 'dashboardDealType', payload: { key: '10000000005', context: { account: '10000000005', contract_origin: null }, facts: F({ account: '10000000005', deal_date: null, deal_type: null, financed: null, in_sales_report: false }) },
+      options: opt([['new', 'new'], ['upgrade', 'upgrade']]) },
+    { kind: 'dashboardPenderStatus', payload: { key: '10000000005', context: { account: '10000000005', fdp_set: false, has_schedule: false }, facts: F({ account: '10000000005', deal_date: null, financed: null, in_sales_report: false }) },
+      options: opt([['pender', 'pender (financed)'], ['non-pender', 'full-down (paid in full at signing)']]) },
+    { kind: 'tradeEquity', payload: { key: '10000000001', context: { account: '10000000001', purchase_price: 26000, volume: 24000 }, facts: F() },
+      options: opt([['align', 'align basis'], ['abort', 'abort the run (I will investigate)']]) },
+    { kind: 'tombstoneDealType', payload: { key: '10000000006', context: { account: '10000000006', contract_origin: null }, facts: F({ account: '10000000006', owner: 'Kim Example', status_desc: null, on_dashboard: false, deal_type: null, paid: { state: 'not_paid', amount: 900, rate: 6 } }) },
+      options: opt([['new', 'new'], ['upgrade', 'upgrade']]) },
+    { kind: 'tombstoneCancelReason', payload: { key: '10000000006', context: { account: '10000000006', pdf_absent: false, full_down: 'Y' }, facts: F({ account: '10000000006', owner: 'Kim Example', status_desc: null, on_dashboard: false, financed: false, paid: { state: 'not_paid', amount: 900, rate: 6 } }) },
+      options: opt([['unpaid_pender', 'unpaid pender'], ['rescission', 'rescission']]) },
+    { kind: 'cookie', payload: { key: 'cookie-1', title: 'The runner needs a fresh dashboard sign-in.', reason: 'Automatic sign-in failed: the dashboard rejected the login.', attempt: 1,
+      instructions: ['In Chrome, sign in to the Westgate dashboard with your own login and open the owner utilization console.', 'Search any account.', 'Open DevTools (F12), Network tab. Right-click a request named "owner-util-services", then Copy, Copy as cURL.', 'Paste the copied text below. Only the Cookie line is kept, and it is erased from the database as soon as the runner reads it.'] }, options: null },
+    { kind: 'scrapeIncomplete', payload: { key: 'scrape-incomplete-1', count: 2, accounts: [{ account: '10000000007', reason: 'HTTP 500', attempts: 4 }, { account: '10000000008', reason: 'timed out', attempts: 4 }] },
+      options: opt([['retry', 'retry now'], ['proceed', 'proceed without them']]) },
+    { kind: 'unparsedRow', payload: { key: 'line-212', context: { line: 212, masked: '10000000009  03/14/2025  E*****, P**  $24,000.00  ?  ...' } },
+      options: opt([['skip', 'skip this row'], ['abort', 'abort the run']]) },
+    { kind: 'splitShellReview', payload: { key: '10000000010', context: { kept_account: '10000000001', shell_account: '10000000010', kept_paid: 2400, shell_paid: 1000, kept_rate: 10, kept_volume: 24000, implied_rate: 14.2 },
+      facts: F({ account: '10000000010', volume: 0, deal_type: 'upgrade', financed: false, status_desc: 'CANCEL-DOWNGRADE', paid: { state: 'paid', amount: 1000, rate: 10 } }), kept_facts: F() },
+      options: opt([['fold_with_flag', 'fold it into the kept deal and FLAG it'], ['own_deal', 'it is its own deal'], ['leave', 'leave it unassigned']]) },
+    { kind: 'cancelledButPaid', payload: { key: '10000000011', paid_amount: 2546, paid_rate: 10, context: { account: '10000000011', status_desc: 'CANCEL-BAD TRADE-PENDING-ESCROW', paid_amount: 2546, paid_rate: 10, contract_date: '2025-01-09', deal_type: 'upgrade', source: 'pdf_absent' },
+      facts: F({ account: '10000000011', owner: 'Ray Example', deal_date: '2025-01-09', volume: 25460, deal_type: 'upgrade', status_desc: 'CANCEL-BAD TRADE-PENDING-ESCROW', paid: { state: 'paid', amount: 2546, rate: 10 } }) },
+      options: opt([['keep_earned', 'late default: rep kept the money'], ['keep_cancelled', 'stranded payment; $0']]) },
+  ].map((q, i) => Object.assign({ id: 9000 + i, asked_at: t, answered_at: null, _preview: true }, q));
+  const answers = { division: 'IN HOUSE', status: 'earned', mismatch: 'dashboard', blocking: 'skip', penderLiveness: 'terminal', dashboardDealType: 'upgrade', dashboardPenderStatus: 'pender',
+    tradeEquity: 'align', tombstoneDealType: 'new', tombstoneCancelReason: 'unpaid_pender', cookie: { consumed: true }, scrapeIncomplete: 'proceed', unparsedRow: 'skip', splitShellReview: 'fold_with_flag', cancelledButPaid: 'keep_earned' };
+  const answered = qs.map((q, i) => Object.assign({}, q, { id: 9100 + i, answered_at: t, answered_by_email: 'admin@example.com', answer: answers[q.kind] }));
+
+  const report = {
+    version: 1, generated_at: t, reference_date: '2026-09-10', target: { email, id: 'u-preview' },
+    rules: { rate_new: 14, rate_upgrade: 10, rate_voa: 12, rate_pender: 6, bad_trade_cancel_days: 90 },
+    counts: { total: 128, earned: 101, pending: 9, cancelled: 18, cancelled_rescission: 11, cancelled_unpaid: 7 },
+    totals: { earned: { volume: 2413000, commission: 231640 }, pending: { volume: 178000, commission: 10680 }, cancelled: { volume: 402000 } },
+    deal_type: { new: 77, upgrade: 51 }, market_source: [{ source: 'IN HOUSE', count: 90 }, { source: 'OWNER REFERRAL', count: 38 }], voa_rate_applied: 0,
+    penders: { total: 24, came_good: 8, unpaid: 7, with_schedule: 21, sparse: [{ account: '10000000012', status_desc: 'PENDING-HOLD' }] },
+    split_groups: [{ accounts: ['10000000001', '10000000010'], asymmetry: false }],
+    bad_trade_reclass: { count: 2, commission_moved: 3200 },
+    borderline: [{ account: '10000000013', gap: 95, payments: 1, classified: 'earned', call: 'later default' }],
+    decisions: answered.map((q) => ({ kind: q.kind, key: q.payload.key, answer: typeof q.answer === 'object' ? 'consumed' : q.answer })),
+    tombstones: [{ account: '10000000006', owner: 'Kim Example', deal_date: '2024-11-02', deal_type: 'new', volume: 15000, rate: 6, amount: 900, cancel_reason: 'unpaid_pender' }],
+    could_not_scrape: [{ account: '10000000007', deal_date: '2025-02-01', owner: 'Ash Example', volume: 12000, report_bucket: 'IMPORT', report_amount: 1200, reason: 'scrape error: HTTP 500 (4 attempts)' }, { account: '10000000014', deal_date: '2024-08-19', owner: 'Val Example', volume: 30000, report_bucket: null, report_amount: null, reason: 'no match on the dashboard' }],
+    targeted_excluded: [], excluded_d: [{ account: '10000000015', owner: 'Dee Example', date: '05/05/2025', volume: 0, sale: 'N', money_bearing: false }],
+    pdf_absent: [{ account: '10000000005', provenance: {} }],
+    contract: { ok: true, total: 128, by_rule: Object.keys(IMPORT_RULE_WORDS).map((name) => ({ name, spec: '', severity: name === 'volume_and_rate_positive' || name === 'pender_has_final_payment_date' ? 'flag' : 'abort', pass: name === 'pender_has_final_payment_date' ? 127 : 128, fail: name === 'pender_has_final_payment_date' ? 1 : 0 })),
+      violations: [], flags: [{ account: '10000000012', rule: 'pender_has_final_payment_date', spec: '', message: '' }] },
+    sanity: { zero_volume: [], empty_owners: [] },
+    employee_guard: { status: 'match', salesPerson: '11111', employeeNumber: '11111' },
+    listing_reconciliation: { total_rows: 140, buckets: { imported: [], excluded_by_gate: [{ account: '10000000016', flags: ['Sale=N'] }], excluded_D: [{ account: '10000000015', origin: 'D', money_bearing: false }], already_on_account: [{ account: '10000000017' }], operator_skipped: [{ account: '10000000004', decision: 'skip' }], could_not_scrape: [{ account: '10000000007', reason: 'HTTP 500' }, { account: '10000000014', reason: 'no match' }], not_targeted: [], unparsed: [{ line: 212, decision: 'skip' }] },
+      imported_pdf_absent: ['10000000005'], unaccounted: [], counts: { imported: 127, excluded_by_gate: 6, excluded_D: 1, already_on_account: 2, operator_skipped: 1, could_not_scrape: 2, not_targeted: 0, unparsed: 1 }, tie_out: true, complete: true,
+      report_groups: { total: 131, matched: 118, report_only: 13, tie_out: true } },
+    commission: {
+      employee: '11111', parse: { data_lines: 260, accounts: 131, voa_excluded: 0, self_validation_pass: true, sum_amounts: 240110, grand_total: 240110 },
+      buckets: { IMPORT: 110, 'SKIP-notpaid': 12, 'SKIP-pending': 6, 'CHARGEBACK-REVIEW': 2, REVIEW: 1 },
+      matching: { deals: 128, matched: 118, missing_from_report: 10, report_only: 13 },
+      imported: { count: 104, total: 229400, rows: [{ account: '10000000001', owner: 'Pat Example', computed_rate: 14, imported_rate: 10, computed_amount: 3360, imported_amount: 2400, flags: ['amount-vs-volume'] }, { account: '10000000018', owner: 'Jo Example', computed_rate: 10, imported_rate: 10, computed_amount: 1500, imported_amount: 1500, flags: [] }] },
+      left_computed: { skip_notpaid: 9, skip_pending: 5, zero_rate: 1, missing_from_report: 10 },
+      missing_from_report_accounts: ['10000000019', '10000000020'],
+      report_only_by_class: { already_on_account: 6, absent_from_listing: 3, excluded_by_gate: 2, split_shell: 2 },
+      folded: [{ kept_account: '10000000021', shells: [{ account: '10000000022', amount: 1100 }], kept_paid: 1100, sum: 2200, rate: 10, volume: 22000 }],
+      flagged_shells: [{ kept_account: '10000000001', account: '10000000010', amount: 1000, implied_rate: 14.2 }],
+      own_deal_shells: [], rate_from_report: [{ account: '10000000023', rate: 7, bucket: 'SKIP-notpaid', amount_before: 900, amount_after: 1050 }],
+      split_shell_review: [], kept_earned: [{ account: '10000000011', status_desc: 'CANCEL-BAD TRADE-PENDING-ESCROW', paid_amount: 2546, paid_rate: 10, source: 'pdf_absent', by: 'admin@example.com' }],
+      cancelled_but_paid: [], chargeback_review: [{ account: '10000000024', suggested_amount: -640, rate: 10, cancelled: true, cancel_reason: 'rescission', lines: [] }],
+      arbitrated: [], cross_checks: { import_but_cancelled: [{ account: '10000000025', report_amount: 1300, rate: 10, cancel_reason: 'rescission' }], skip_notpaid_earned: [{ account: '10000000026', computed_amount: 2100, rate: 14 }], volume_mismatch: [], existing_owner_rate: [], existing_owner_pre_era_skipped: 0 },
+      report_only: [
+        { account: '10000000017', bucket: 'IMPORT', status: 'IMPORT', amount: 1700, split_shell: null, class: 'already_on_account', reason: 'in the app already' },
+        { account: '10000000027', bucket: 'IMPORT', status: 'IMPORT', amount: 2300, split_shell: null, class: 'already_on_account', reason: 'in the app already' },
+        { account: '10000000028', bucket: 'IMPORT', status: 'IMPORT', amount: 1806, split_shell: null, class: 'absent_from_listing', reason: 'paid but not in the all-deals report' },
+        { account: '10000000016', bucket: 'IMPORT', status: 'IMPORT', amount: 600, split_shell: null, class: 'excluded_by_gate', reason: 'listing row fails the include gate: Sale=N' },
+        { account: '10000000029', bucket: 'IMPORT', status: 'IMPORT', amount: 1000, split_shell: null, class: 'split_shell', reason: 'split sibling of 10000000030: left unassigned by the operator (paid 1000)' },
+      ],
+    },
+  };
+  const done = Object.assign({}, report, { insert: { attempted: 128, inserted: 126, already_present: 2 },
+    reconcile: { imported_total: 126, earned: 100, pending: 9, cancelled: 17, cancelled_rescission: 10, cancelled_unpaid: 7, promised: 128, manual_entry: ['10000000007', '10000000014'], own_deal_shells: [], tombstoned: 1 },
+    post_contract: { ok: true, checked: 126, violations: [], flags: 1 }, finished_at: t });
+  const failedReport = Object.assign({}, report, { contract: Object.assign({}, report.contract, { ok: false, violations: [{ account: '10000000031', rule: 'unpaid_is_terminal', spec: '', message: '' }] }) });
+  const job = (over) => Object.assign({ id: 'preview', target_user_id: 'u-preview', status: 'awaiting_review', created_at: t, created_by_email: 'admin@example.com', pdf_history_path: 'jobs/preview/history.pdf', pdf_commission_path: 'jobs/preview/commission.pdf', progress: { counts: { to_insert: 128 } }, _preview: true }, over || {});
+  return { rep, email, qs, answered, report, done, failedReport, job };
+}
+
+function toolsImportPreview() {
+  const fx = importPreviewFixtures();
+  const root = el('div', {});
+  const screen = (job, extra) => Object.assign({ rep: fx.rep, email: fx.email, job, questions: fx.answered, reportUrl: null, reportStatus: 'missing', purgedAt: null }, extra || {});
+  root.append(el('div', { class: 'row', style: 'margin-bottom:12px' }, el('button', { class: 'btn btn-small', onclick: () => nav('tools/import') }, '← All imports'),
+    el('span', { class: 'badge badge-neutral', text: 'preview' }), el('span', { class: 'muted small', text: 'Every import screen from made-up data. Nothing here is real, and nothing is sent.' })));
+  const fakeDetail = { drafts: {}, msgs: {} };
+  root.append(el('div', { class: 'card' }, el('div', { class: 'card-title' }, el('h2', { text: 'Questions, every kind' })),
+    fx.qs.map((q) => importQuestionCard(q, fakeDetail, false, fx.rep))));
+  root.append(el('div', { class: 'card' }, el('div', { class: 'card-title' }, el('h2', { text: 'Answered, every kind' })),
+    el('div', { class: 'q-answers' }, fx.answered.map((q) => importAnsweredQuestion(q, fx.rep)))));
+  root.append(importReviewCard(fx.report, screen(fx.job())));
+  root.append(importActionsCard(fx.job(), screen(fx.job())));
+  root.append(importResultsCard(fx.done, screen(fx.job({ status: 'done' }))));
+  root.append(el('div', { class: 'card' }, el('div', { class: 'card-title' }, el('h2', { text: 'Done, with nothing left' })),
+    importResultsCard(Object.assign({}, fx.done, { commission: null, could_not_scrape: [], reconcile: Object.assign({}, fx.done.reconcile, { manual_entry: [] }), borderline: [], tombstones: [], pdf_absent: [], split_groups: [], penders: Object.assign({}, fx.done.penders, { sparse: [] }), contract: Object.assign({}, fx.done.contract, { flags: [] }), decisions: [] }),
+      screen(fx.job({ status: 'done' }), { questions: [] }))));
+  root.append(el('div', { class: 'card' }, el('div', { class: 'card-title' }, el('h2', { text: 'Failed' })),
+    importFailedCard(fx.job({ status: 'failed', error_code: 'contract_violation', error_detail: 'App data-model contract failed (1 violation(s)). Nothing inserted.' }), fx.failedReport, screen(fx.job({ status: 'failed' }))),
+    el('div', { style: 'margin-top:12px' }, importFailedCard(fx.job({ status: 'failed', error_code: 'runner_crash', error_detail: 'TypeError: cannot read properties of undefined' }), null, screen(fx.job({ status: 'failed' }))))));
+  return root;
 }
 
 // ---------------------------------------------------------------------------
