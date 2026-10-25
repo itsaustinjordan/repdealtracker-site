@@ -175,6 +175,128 @@ function planBadge(plan) {
   return el('span', { class: 'badge badge-neutral', text: String(plan) }); // unknown renders as itself
 }
 
+// ---------------------------------------------------------------------------
+// Plans and subscriptions (admin-api plan_summary / get_user_detail). Every
+// string here is user-facing: plain English, no internal codes.
+// ---------------------------------------------------------------------------
+const PLAN_KIND_ORDER = { pro: 0, comped: 1, trial: 2, lapsed: 3 };
+const PLAN_FILTERS = [
+  ['all', 'All'], ['pro', 'Pro'], ['comped', 'Comped'], ['trial', 'Trial'],
+  ['lapsed', 'Lapsed'], ['billing', 'Billing issue'],
+];
+
+const planKind = (u) => (u && u.plan_summary && u.plan_summary.kind) || null;
+const hasBillingIssue = (u) => /billing issue/i.test((u && u.plan_summary && u.plan_summary.label) || '');
+
+// The plan as shown: the server label, with the free-scan count for trials.
+function planText(summary, freeScans) {
+  if (!summary) return null;
+  if (summary.kind === 'trial' && freeScans) {
+    return 'Trial · ' + intFmt(freeScans.used) + '/' + intFmt(freeScans.cap);
+  }
+  return summary.label || 'Unknown';
+}
+
+function planKindBadge(summary, freeScans) {
+  if (!summary) return null;
+  const billing = /billing issue/i.test(summary.label || '');
+  const cls = billing ? 'badge-danger'
+    : summary.kind === 'pro' ? 'badge-accent'
+      : summary.kind === 'comped' ? 'badge-success'
+        : summary.kind === 'lapsed' ? 'badge-warning' : 'badge-neutral';
+  return el('span', { class: 'badge ' + cls, text: planText(summary, freeScans) });
+}
+
+function planMatchesFilter(u, filter) {
+  if (!filter || filter === 'all') return true;
+  if (filter === 'billing') return hasBillingIssue(u);
+  return planKind(u) === filter;
+}
+
+const PRODUCT_NAMES = {
+  dt_pro_monthly_599: 'Pro Monthly $5.99',
+  dt_pro_annual_5999: 'Pro Annual $59.99',
+};
+const productName = (id) => (id ? (PRODUCT_NAMES[id] || String(id)) : '—');
+
+const STORE_NAMES = {
+  APP_STORE: 'App Store', MAC_APP_STORE: 'Mac App Store', PLAY_STORE: 'Google Play',
+  STRIPE: 'Stripe', PROMOTIONAL: 'Granted in RevenueCat', AMAZON: 'Amazon', RC_BILLING: 'Web billing',
+};
+const storeName = (s) => (s ? (STORE_NAMES[s] || humanize(String(s).toLowerCase())) : '—');
+
+// "Oct 24, 2027" in the viewer's timezone.
+function fmtDay(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return isNaN(d) ? '—' : d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+const RC_EVENT_NAMES = {
+  INITIAL_PURCHASE: 'First purchase', RENEWAL: 'Renewal', CANCELLATION: 'Turned off auto-renew',
+  UNCANCELLATION: 'Turned auto-renew back on', NON_RENEWING_PURCHASE: 'One-time purchase',
+  EXPIRATION: 'Expired', BILLING_ISSUE: 'Billing issue', PRODUCT_CHANGE: 'Changed plan',
+  TRANSFER: 'Moved between accounts', SUBSCRIPTION_PAUSED: 'Paused', SUBSCRIPTION_EXTENDED: 'Extended',
+  TEMPORARY_ENTITLEMENT_GRANT: 'Temporary access', TEST: 'Test event', REFUND_REVERSED: 'Refund reversed',
+};
+const rcEventName = (t) => RC_EVENT_NAMES[t] || 'Other event';
+
+const RC_SKIP_TEXT = {
+  user_not_found: 'No matching account',
+  sandbox_not_allowlisted: 'Sandbox purchase, not applied',
+  stale: 'Older than current state, skipped',
+  lookup_error: 'Lookup failed, will retry',
+  write_error: 'Save failed, will retry',
+  unhandled_type: 'Recorded only',
+  transfer_target_no_source: 'Transferred in, details pending refresh',
+  duplicate: 'Duplicate delivery',
+};
+function rcEventStatus(ev) {
+  if (ev.skip_reason && RC_SKIP_TEXT[ev.skip_reason]) return RC_SKIP_TEXT[ev.skip_reason];
+  return ev.applied ? 'Applied' : 'Not applied';
+}
+const rcEnvironment = (e) => (e === 'SANDBOX' ? 'Sandbox' : e === 'PRODUCTION' ? 'Live' : '—');
+
+// Field names in refresh results, in plain words.
+const RC_FIELD_WORDS = {
+  is_active: 'access', expires_at: 'renewal date', product_id: 'product', store: 'store',
+  period_type: 'billing period', purchased_at: 'purchase date', original_purchase_at: 'first purchase date',
+  will_renew: 'auto-renew', unsubscribe_detected_at: 'cancellation date',
+  billing_issue_detected_at: 'billing issue', grace_period_expires_at: 'grace period',
+  environment: 'environment', rc_app_user_id: 'RevenueCat ID', rc_original_app_user_id: 'original RevenueCat ID',
+  rc_customer_url: 'RevenueCat link',
+};
+const rcFieldWord = (f) => RC_FIELD_WORDS[f] || 'other detail';
+
+const planWord = (p) => (p === 'comped' ? 'Comped' : p === 'standard' ? 'Standard' : (p ? String(p) : 'Standard'));
+const overrideWord = (v) => (v == null ? 'none' : intFmt(v));
+
+// One admin_actions row (entitlement-related) as a sentence.
+function adminHistoryText(a) {
+  const p = (a && a.details) || {};
+  if (a.action === 'set_entitlement') {
+    const next = p.new_plan || p.plan;
+    const prev = p.previous_plan;
+    if (prev && prev === next) return 'Plan saved as ' + planWord(next) + ' (no change)';
+    const head = next === 'comped' ? 'Comped' : 'Set to ' + planWord(next);
+    return prev ? head + ' (was ' + planWord(prev) + ')' : head;
+  }
+  if (a.action === 'set_free_scan_override') {
+    if (p.new === p.previous) return 'Free scan override saved at ' + overrideWord(p.new) + ' (no change)';
+    if (p.new == null) return 'Free scan override cleared (was ' + overrideWord(p.previous) + ')';
+    return 'Free scan override set to ' + overrideWord(p.new) + ' (was ' + overrideWord(p.previous) + ')';
+  }
+  if (a.action === 'rc_refresh') {
+    if (p.result === 'not_found') return 'Refreshed from RevenueCat: no customer found';
+    if (p.result !== 'ok') return 'Refresh from RevenueCat failed';
+    const n = Array.isArray(p.changed) ? p.changed.length : 0;
+    return n ? 'Refreshed from RevenueCat: ' + n + (n === 1 ? ' field' : ' fields') + ' updated'
+      : 'Refreshed from RevenueCat: already up to date';
+  }
+  if (a.action === 'manual_entitlement_reset') return 'Plan reset by hand';
+  return 'Plan change';
+}
+
 function statusPill(s) {
   const cls = s === 'success' ? 'badge-success'
     : (s === 'parse_fail' || s === 'api_fail') ? 'badge-danger'
@@ -420,12 +542,14 @@ window.DT.onRoute = (route) => {
     if (!state.detail || state.detail.userId !== userId) {
       state.detail = {
         userId, tab, data: null, error: '', deleted: null, integrity: null, integrityRunning: false,
+        plan: null, planErr: '', flash: {},
         deals: { query: '', cancelled: 'any', pender: 'any', offset: 0, rows: null, total: 0, error: '' },
         activity: { rows: null, nextBefore: null, error: '', loadingMore: false },
         deletedDeals: { rows: null, error: '' },
       };
       loadUsers(false);
       loadDetail(userId);
+      loadPlanDetail(userId);
     } else {
       state.detail.tab = tab;
     }
@@ -478,6 +602,32 @@ async function loadDetail(userId) {
     if (!state.detail || state.detail.userId !== userId) return;
     state.detail.error = e.message;
     state.detail.data = { aggregates: {}, events: [], settings: null, cap: null, entitlement: null };
+  }
+  if (state.route.name === 'user') render();
+}
+
+// Plan, usage, RevenueCat events and plan history (get_user_detail). Also
+// copies the plan and scan fields onto the cached list row, so the users
+// list is current after any action here without a full reload.
+async function loadPlanDetail(userId) {
+  try {
+    const resp = await adminApi('get_user_detail', { user_id: userId });
+    if (!state.detail || state.detail.userId !== userId) return;
+    state.detail.plan = resp || {};
+    state.detail.planErr = '';
+    const u = (C.users || []).find((x) => x.user_id === userId);
+    if (u && resp) {
+      if (resp.plan_summary) u.plan_summary = { kind: resp.plan_summary.kind, label: resp.plan_summary.label };
+      if (resp.free_scans) u.free_scans = resp.free_scans;
+      if (resp.entitlement && typeof resp.entitlement.plan === 'string') u.plan = resp.entitlement.plan;
+      if (resp.scans) u.scans_30d = resp.scans.d30;
+      u.last_scan_at = resp.last_scan_at || null;
+    }
+  } catch (e) {
+    if (e.handled) return;
+    if (!state.detail || state.detail.userId !== userId) return;
+    state.detail.planErr = e.message;
+    state.detail.plan = state.detail.plan || {};
   }
   if (state.route.name === 'user') render();
 }
@@ -722,12 +872,12 @@ function viewOverview() {
     return card;
   };
 
-  grid.append(stat('Scans today', 'Extraction requests since midnight UTC — successes, failures, and blocked attempts all count.',
+  grid.append(stat('Scans today', 'Pages scanned since midnight UTC. One scan is one page read successfully. The line below counts batches: one batch can hold several pages.',
     intFmt(today.scans),
-    intFmt(today.success) + ' ok · ' + intFmt(today.failures) + ' failed · ' + intFmt(today.blocked) + ' blocked',
+    'Batches: ' + intFmt(today.success) + ' ok · ' + intFmt(today.failures) + ' failed · ' + intFmt(today.blocked) + ' blocked',
     sparkline(spark30.map((r) => num(r.total)), 'var(--accent)')));
 
-  grid.append(stat('Fail rate 7d', 'Of scans that actually ran in the last 7 days (blocked ones don’t count), the share that failed with a parse or API error.',
+  grid.append(stat('Fail rate 7d', 'Of scan batches that actually ran in the last 7 days (blocked ones don’t count), the share that failed with a parse or API error.',
     d.fail_rate_7d == null ? '—' : pctFmt(d.fail_rate_7d),
     d.fail_rate_7d == null ? 'no scans ran this week' : null));
 
@@ -756,7 +906,7 @@ function viewOverview() {
   // --- 30d chart ---
   wrap.append(el('div', { class: 'card' },
     el('div', { class: 'card-title' }, el('h2', { text: 'Scans — last 30 days' }),
-      tip('Total extraction requests per UTC day, every outcome included. The Stats tab breaks this down by result.')),
+      tip('Pages scanned per UTC day. One scan is one page read successfully. The Stats tab breaks batches down by result.')),
     lineChart([{ label: 'Scans', color: 'var(--accent)', area: true, points: spark30.map((r) => ({ x: r.date, y: num(r.total) })) }],
       { height: 190, noLegend: true })));
 
@@ -764,7 +914,7 @@ function viewOverview() {
   const cols2 = el('div', { class: 'stack', style: 'margin-top:16px' });
   const failCard = el('div', { class: 'card' },
     el('div', { class: 'card-title' }, el('h2', { text: 'Recent failures' }),
-      tip('The last 5 scans that didn’t succeed, all time. Click one to open that user.')));
+      tip('The last 5 scan batches that didn’t succeed, all time. Click one to open that user.')));
   const fails = d.recent_failures || [];
   if (!fails.length) {
     failCard.append(emptyState('No failures recorded', 'When a scan fails to parse or the API errors, it shows up here.'));
@@ -815,13 +965,26 @@ const USER_SORTS = {
   deal_count: { get: (u) => num(u.deal_count), dir: 'desc' },
   volume_sum: { get: (u) => num(u.volume_sum), dir: 'desc' },
   scans_30d: { get: (u) => num(u.scans_30d), dir: 'desc' },
+  last_scan_at: { get: (u) => u.last_scan_at || '', dir: 'desc', str: true },
+  // Groups by kind (pro, comped, trial, lapsed), then by label within it.
+  plan: {
+    get: (u) => {
+      const k = planKind(u);
+      const rank = k in PLAN_KIND_ORDER ? PLAN_KIND_ORDER[k] : 9;
+      return rank + ' ' + ((u.plan_summary && u.plan_summary.label) || '').toLowerCase();
+    },
+    dir: 'asc', str: true,
+  },
 };
 
-function userBadges(u) {
+// withPlanColumn: the users list shows the plan in its own column, so the
+// email cell skips the plan badge there.
+function userBadges(u, withPlanColumn) {
   const out = [];
   if (u.is_admin) out.push(el('span', { class: 'badge badge-accent', text: 'ADMIN' }));
   if (u.banned) out.push(el('span', { class: 'badge badge-danger', text: 'BANNED' }));
-  const pb = planBadge(u.plan);
+  const pb = withPlanColumn ? null
+    : (u.plan_summary ? planKindBadge(u.plan_summary, u.free_scans) : planBadge(u.plan));
   if (pb) out.push(pb);
   if (typeof u.note === 'string' && u.note.trim()) {
     out.push(el('span', { class: 'badge badge-outline', text: '✎ note', title: truncate(u.note, 300) }));
@@ -848,10 +1011,43 @@ function viewUsers() {
     return wrap;
   }
 
+  // -- subscriber summary (from the loaded list) --
+  const all = C.users;
+  const pros = all.filter((u) => planKind(u) === 'pro');
+  const label = (u) => (u.plan_summary && u.plan_summary.label) || '';
+  const monthly = pros.filter((u) => /^Pro Monthly/.test(label(u))).length;
+  const annual = pros.filter((u) => /^Pro Annual/.test(label(u))).length;
+  const comped = all.filter((u) => planKind(u) === 'comped').length;
+  const trial = all.filter((u) => planKind(u) === 'trial').length;
+  const lapsed = all.filter((u) => planKind(u) === 'lapsed').length;
+  const billing = all.filter(hasBillingIssue).length;
+  const summaryParts = [
+    intFmt(pros.length) + ' active (' + intFmt(monthly) + ' monthly, ' + intFmt(annual) + ' annual)',
+    intFmt(comped) + ' comped',
+    intFmt(trial) + ' on trial',
+    intFmt(lapsed) + ' lapsed',
+  ];
+  if (billing) summaryParts.push(intFmt(billing) + ' with a billing issue');
+  wrap.append(el('div', { class: 'card', style: 'margin-bottom:12px' },
+    el('p', { style: 'margin:0' }, el('strong', { text: 'Subscribers: ' }), summaryParts.join(' · '),
+      ' ', tip('Counted from the list below. Active means a paid subscription that has not expired. Trial means free scans only.'))));
+
   const search = el('input', { type: 'text', class: 'input-search', placeholder: 'Filter by email…', style: 'min-width:220px' });
   search.value = C.usersQuery;
   const countEl = el('p', { class: 'muted small', style: 'margin:8px 0' });
   const tableSlot = el('div', {});
+  const planFilter = () => C.usersPlan || 'all';
+  const filterTabs = el('div', { class: 'subtabs', role: 'group', 'aria-label': 'Filter by plan' });
+  const paintFilterTabs = () => {
+    filterTabs.textContent = '';
+    for (const [id, text] of PLAN_FILTERS) {
+      filterTabs.append(el('button', {
+        class: 'subtab' + (planFilter() === id ? ' active' : ''),
+        type: 'button',
+        onclick: () => { C.usersPlan = id; paintFilterTabs(); renderTable(); },
+      }, text));
+    }
+  };
 
   const sortableTh = (key, label, cls) => {
     const active = C.usersSort.key === key;
@@ -875,6 +1071,7 @@ function viewUsers() {
     const q = C.usersQuery.trim().toLowerCase();
     let list = (C.users || []).slice();
     if (q) list = list.filter((u) => (u.email || '').toLowerCase().includes(q));
+    list = list.filter((u) => planMatchesFilter(u, planFilter()));
     const s = USER_SORTS[C.usersSort.key] || USER_SORTS.created_at;
     const mul = C.usersSort.dir === 'asc' ? 1 : -1;
     list.sort((a, b) => {
@@ -887,36 +1084,48 @@ function viewUsers() {
       : list.length + ' of ' + C.users.length + ' users';
     tableSlot.textContent = '';
     if (!list.length) {
-      tableSlot.append(emptyState('No matching users', 'Nobody’s email contains “' + C.usersQuery.trim() + '”.'));
+      const EMPTY_BY_FILTER = {
+        pro: 'No paying subscribers', comped: 'No comped users', trial: 'Nobody on trial',
+        lapsed: 'No lapsed subscribers', billing: 'No billing issues',
+      };
+      tableSlot.append(q
+        ? emptyState('No matching users', 'Nobody’s email contains “' + C.usersQuery.trim() + '”' +
+          (planFilter() === 'all' ? '.' : ' with this plan filter.'))
+        : emptyState(EMPTY_BY_FILTER[planFilter()] || 'No matching users', 'Nobody matches this filter right now.'));
       return;
     }
     tableSlot.append(buildTable(
       [
         sortableTh('email', 'Email'),
+        sortableTh('plan', 'Plan'),
         sortableTh('created_at', 'Joined'),
         sortableTh('last_active', 'Last active'),
         sortableTh('deal_count', 'Deals', 'num'),
         sortableTh('volume_sum', 'Volume', 'num'),
         sortableTh('scans_30d', 'Scans 30d', 'num'),
-        { label: 'Scans 24h', cls: 'num', tip: 'Scans in the last 24 hours against this user’s daily cap. Blocked attempts don’t count.' },
+        { label: 'Scans 24h', cls: 'num', tip: 'Pages scanned in the last 24 hours, against this user’s daily cap. One scan is one page read successfully.' },
+        sortableTh('last_scan_at', 'Last scan'),
       ],
       list.map((u) => ({
         rowClass: 'clickable',
         onclick: () => nav('user/' + u.user_id + '/overview'),
         cells: [
-          el('span', {}, u.email || '—', userBadges(u)),
+          el('span', {}, u.email || '—', userBadges(u, true)),
+          u.plan_summary ? planKindBadge(u.plan_summary, u.free_scans) : (planBadge(u.plan) || 'Standard'),
           relTimeEl(u.created_at),
           relTimeEl(lastActive(u)),
           intFmt(u.deal_count),
           money(u.volume_sum),
           intFmt(u.scans_30d),
           intFmt(u.scans_24h == null ? 0 : u.scans_24h) + ' / ' + capOf(u),
+          relTimeEl(u.last_scan_at),
         ],
       }))));
   };
 
   search.addEventListener('input', () => { C.usersQuery = search.value; renderTable(); });
-  wrap.append(el('div', { class: 'row', style: 'margin-bottom:4px' }, search), countEl, tableSlot);
+  paintFilterTabs();
+  wrap.append(el('div', { class: 'row', style: 'margin-bottom:4px' }, search, filterTabs), countEl, tableSlot);
   renderTable();
   return wrap;
 }
@@ -971,6 +1180,9 @@ function sectionOverview(d, row) {
   const adminTip = 'Admin accounts cannot be banned or deleted';
   const root = el('div', { class: 'stack' });
 
+  // -- plan, usage, RevenueCat history, plan history (get_user_detail) --
+  root.append(sectionPlanCard(d, row), sectionUsageCard(d), sectionRcEventsCard(d), sectionPlanHistoryCard(d));
+
   // -- aggregates --
   const a = Object.assign({}, row, (d.data && d.data.aggregates) || {});
   const aggCard = el('div', { class: 'card' });
@@ -989,45 +1201,6 @@ function sectionOverview(d, row) {
   aggCard.append(el('dl', { class: 'agg-grid' }, items.map(([k, v]) =>
     el('div', { class: 'agg-item' }, el('dt', { text: k }), el('dd', { text: v })))));
   root.append(aggCard);
-
-  // -- plan (entitlement) --
-  const planCard = el('div', { class: 'card' },
-    el('div', { class: 'card-title' }, el('h2', { text: 'Plan' }),
-      tip('What this user pays. “Comped” means free access forever — meant for testers and friends; it will bypass the future paywall.')));
-  const ent = d.data && d.data.entitlement;
-  const currentPlan = (ent && typeof ent.plan === 'string') ? ent.plan : (row.plan || 'standard');
-  const planSel = el('select', {},
-    el('option', { value: 'standard', text: 'standard — normal (future: paying) user' }),
-    el('option', { value: 'comped', text: 'comped — free access, never billed' }));
-  if (!['standard', 'comped'].includes(currentPlan)) {
-    planSel.prepend(el('option', { value: currentPlan, text: currentPlan + ' (current)' })); // unknown ≠ default
-  }
-  planSel.value = currentPlan;
-  const planNote = el('input', { type: 'text', placeholder: 'Why (optional — e.g. “beta tester”)', style: 'flex:1;min-width:160px' });
-  if (ent && typeof ent.note === 'string') planNote.value = ent.note;
-  const planMsg = el('p', { class: 'msg' });
-  const planSave = el('button', { class: 'btn btn-primary btn-small' }, 'Save plan');
-  planSave.addEventListener('click', async () => {
-    planSave.disabled = true;
-    setMsg(planMsg, 'info', 'Saving…');
-    try {
-      const params = { user_id: d.userId, plan: planSel.value };
-      if (planNote.value.trim()) params.note = planNote.value.trim();
-      await adminApi('set_entitlement', params);
-      row.plan = planSel.value;
-      if (C.users) {
-        const u = C.users.find((x) => x.user_id === d.userId);
-        if (u) u.plan = planSel.value;
-      }
-      setMsg(planMsg, 'ok', 'Plan saved.');
-      toast('ok', 'Plan set to ' + planSel.value + '.');
-    } catch (e) {
-      if (!e.handled) setMsg(planMsg, 'err', e.message);
-    }
-    planSave.disabled = false;
-  });
-  planCard.append(el('div', { class: 'row' }, planSel, planNote, planSave), planMsg);
-  root.append(planCard);
 
   // -- admin note --
   const noteCard = el('div', { class: 'card' },
@@ -1108,7 +1281,7 @@ function sectionOverview(d, row) {
   // -- scan cap / pause --
   const capCard = el('div', { class: 'card' },
     el('div', { class: 'card-title' }, el('h2', { text: 'Daily scan cap' }),
-      tip('How many scans this user may run per rolling 24 hours. Empty override = the app-wide default. Pause sets the cap to 0 — the user keeps their data but can’t scan.')));
+      tip('How many pages this user may scan per rolling 24 hours. One scan is one page read successfully. Empty override means the app-wide default. Pause sets the cap to 0: the user keeps their data but can’t scan.')));
   const defCap = C.config ? C.config.default_daily_scan_cap : undefined;
   const defLabel = 'default' + (defCap != null ? ' (' + defCap + ')' : ' (unknown)');
   const capRow = d.data && d.data.cap;
@@ -1261,12 +1434,12 @@ function sectionOverview(d, row) {
 
   // -- recent scan events --
   const evCard = el('div', { class: 'card' },
-    el('div', { class: 'card-title' }, el('h2', { text: 'Recent scan events' }),
-      tip('This user’s last 50 extraction requests — result, model, token spend, and timing.')));
+    el('div', { class: 'card-title' }, el('h2', { text: 'Recent scan batches' }),
+      tip('This user’s last 50 batches of pages sent to be read: result, model, token spend, and timing. One batch can hold several scans.')));
   if (!d.data) {
     evCard.append(skeletonRows(4, 18));
   } else if (!d.data.events.length) {
-    evCard.append(emptyState('No scan events', 'Scan history appears once this user runs an extraction. History exists from 2026-07-16 (telemetry deploy day).'));
+    evCard.append(emptyState('No scan batches', 'Scan history appears once this user scans a page. History starts on 2026-07-16.'));
   } else {
     evCard.append(buildTable(
       [{ label: 'When' }, { label: 'Status' }, { label: 'Model' }, { label: 'Tokens in/out', cls: 'num' }, { label: 'Duration', cls: 'num' }, { label: 'Error' }, { label: '' }],
@@ -1293,6 +1466,227 @@ function sectionOverview(d, row) {
   }
   root.append(evCard);
   return root;
+}
+
+// A message that survives the re-render after an action (d.flash[key]).
+function flashMsg(d, key) {
+  const m = el('p', { class: 'msg' });
+  const f = d.flash && d.flash[key];
+  if (f) setMsg(m, f.kind, f.text);
+  return m;
+}
+
+function aggList(items) {
+  return el('dl', { class: 'agg-grid' }, items.map(([k, v]) =>
+    el('div', { class: 'agg-item' }, el('dt', { text: k }),
+      v && v.nodeType ? el('dd', {}, v) : el('dd', { text: v == null ? '—' : String(v) }))));
+}
+
+function sectionPlanCard(d, row) {
+  const card = el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'Plan' }),
+      tip('What this user has: a paid subscription, comped access, or free trial scans. Subscription details come from RevenueCat.')));
+  const p = d.plan;
+  if (!p) { card.append(skeletonRows(3, 18)); return card; }
+  if (d.planErr) card.append(el('p', { class: 'msg msg-err', text: 'Could not load the plan: ' + d.planErr }));
+
+  const s = p.plan_summary || null;
+  const ent = p.entitlement || {};
+  const fs = p.free_scans || {};
+  card.append(el('p', { style: 'margin:0 0 10px' }, s ? planKindBadge(s, fs) : 'Unknown'));
+
+  // -- subscription facts --
+  const hasSub = !!(ent.product_id || ent.expires_at || ent.purchased_at);
+  const items = [];
+  if (hasSub) {
+    const live = !!s && (s.kind === 'pro' || (s.kind === 'comped' && /also Pro/.test(s.label || '')));
+    const endLabel = !live ? 'Ended on'
+      : ent.will_renew === true ? 'Renews on'
+        : ent.will_renew === false ? 'Ends on' : 'Paid through';
+    items.push(['Product', productName(ent.product_id)]);
+    items.push(['Store', storeName(ent.store)]);
+    items.push(['Purchased', fmtDay(ent.purchased_at)]);
+    items.push([endLabel, fmtDay(ent.expires_at)]);
+    if (s && s.billing_issue && ent.billing_issue_detected_at) items.push(['Billing issue since', fmtDay(ent.billing_issue_detected_at)]);
+    if (ent.environment === 'SANDBOX') items.push(['Environment', 'Sandbox purchase']);
+  } else {
+    items.push(['Subscription', 'None on record']);
+  }
+  card.append(aggList(items));
+  if (p.rc_customer_url) {
+    card.append(el('p', { class: 'small', style: 'margin:10px 0 0' },
+      el('a', { href: p.rc_customer_url, target: '_blank', rel: 'noopener noreferrer' }, 'Open in RevenueCat ↗')));
+  }
+
+  // -- refresh from RevenueCat --
+  const refreshBtn = el('button', { class: 'btn btn-small', type: 'button' }, '↻ Refresh from RevenueCat');
+  refreshBtn.addEventListener('click', async () => {
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = 'Checking RevenueCat…';
+    try {
+      const r = await adminApi('refresh_from_rc', { user_id: d.userId });
+      if (!r || r.found === false) {
+        d.flash.refresh = { kind: 'info', text: 'No RevenueCat customer found' };
+      } else if (!Array.isArray(r.changed) || !r.changed.length) {
+        d.flash.refresh = { kind: 'ok', text: 'Already up to date' };
+      } else {
+        const words = [...new Set(r.changed.map((c) => rcFieldWord(c.field)))];
+        d.flash.refresh = { kind: 'ok', text: 'Updated: ' + words.join(', ') };
+      }
+    } catch (e) {
+      if (e.handled) return;
+      d.flash.refresh = e.code === 'refresh_too_soon'
+        ? { kind: 'info', text: 'Please wait a few seconds, then try again.' }
+        : e.code === 'rc_not_configured'
+          ? { kind: 'err', text: 'RevenueCat refresh is not set up yet: the server has no RevenueCat API key.' }
+          : { kind: 'err', text: e.message };
+    }
+    await loadPlanDetail(d.userId);
+  });
+  card.append(el('div', { class: 'btn-row', style: 'margin-top:12px' }, refreshBtn,
+    tip('Reads this user’s subscription straight from RevenueCat and fixes anything the server has wrong. It never changes comped status or the free scan override.')),
+  flashMsg(d, 'refresh'));
+
+  // -- comp / un-comp (set_entitlement) --
+  const currentPlan = typeof ent.plan === 'string' ? ent.plan : (row.plan || 'standard');
+  const planSel = el('select', { 'aria-label': 'Plan' },
+    el('option', { value: 'standard', text: 'Standard: pays, or uses free scans' }),
+    el('option', { value: 'comped', text: 'Comped: free access, never billed' }));
+  if (!['standard', 'comped'].includes(currentPlan)) {
+    planSel.prepend(el('option', { value: currentPlan, text: currentPlan + ' (current)' })); // unknown ≠ default
+  }
+  planSel.value = currentPlan;
+  const planNote = el('input', { type: 'text', placeholder: 'Why (optional, e.g. “beta tester”)', style: 'flex:1;min-width:160px' });
+  if (typeof ent.note === 'string') planNote.value = ent.note;
+  const planSave = el('button', { class: 'btn btn-primary btn-small', type: 'button' }, 'Save plan');
+  planSave.addEventListener('click', async () => {
+    planSave.disabled = true;
+    try {
+      const params = { user_id: d.userId, plan: planSel.value };
+      if (planNote.value.trim()) params.note = planNote.value.trim();
+      await adminApi('set_entitlement', params);
+      row.plan = planSel.value;
+      const u = (C.users || []).find((x) => x.user_id === d.userId);
+      if (u) u.plan = planSel.value;
+      d.flash.plan = { kind: 'ok', text: 'Plan saved: ' + planWord(planSel.value) + '.' };
+      toast('ok', 'Plan set to ' + planWord(planSel.value) + '.');
+    } catch (e) {
+      if (e.handled) return;
+      d.flash.plan = { kind: 'err', text: e.message };
+    }
+    await loadPlanDetail(d.userId);
+  });
+  card.append(
+    el('h3', { style: 'margin:16px 0 6px' }, 'Comp or un-comp',
+      ' ', tip('Comped means free access with no subscription, for testers and friends. It skips the paywall entirely.')),
+    el('div', { class: 'row' }, planSel, planNote, planSave),
+    flashMsg(d, 'plan'));
+
+  // -- free scan override (set_free_scan_override) --
+  const override = fs.override == null ? null : fs.override;
+  const ovInput = el('input', {
+    type: 'number', min: '0', max: '10000', step: '1', class: 'input-small',
+    placeholder: 'none', value: override != null ? String(override) : '', 'aria-label': 'Free scan override',
+  });
+  const ovSave = el('button', { class: 'btn btn-primary btn-small', type: 'button' }, 'Save');
+  const ovClear = el('button', { class: 'btn btn-small', type: 'button', disabled: override == null }, 'Clear');
+  const applyOverride = (value) => confirmModal({
+    title: value == null ? 'Clear the free scan override?' : 'Set the free scan override to ' + intFmt(value) + '?',
+    body: value == null
+      ? 'This user goes back to the standard free scan allowance. They have used ' + intFmt(fs.used) + ' free scans so far.'
+      : 'This user may use ' + intFmt(value) + ' free scans in total before they need Pro. They have used ' + intFmt(fs.used) + ' so far.',
+    confirmLabel: value == null ? 'Clear override' : 'Save override',
+    onConfirm: async () => {
+      await adminApi('set_free_scan_override', { user_id: d.userId, override: value });
+      d.flash.override = { kind: 'ok', text: value == null ? 'Override cleared.' : 'Override saved: ' + intFmt(value) + ' free scans.' };
+      await loadPlanDetail(d.userId);
+    },
+  });
+  ovSave.addEventListener('click', () => {
+    const raw = ovInput.value.trim();
+    const n = Number(raw);
+    if (raw === '' || !Number.isInteger(n) || n < 0 || n > 10000) {
+      d.flash.override = { kind: 'err', text: 'Enter a whole number from 0 to 10,000, or use Clear.' };
+      render();
+      return;
+    }
+    applyOverride(n);
+  });
+  ovClear.addEventListener('click', () => applyOverride(null));
+  card.append(
+    el('h3', { style: 'margin:16px 0 6px' }, 'Free scan override',
+      ' ', tip('How many free scans this user gets in total before they need Pro. Clear it for the standard allowance. Comped and paying users are never limited.')),
+    el('p', { class: 'small muted', style: 'margin:0 0 6px' },
+      'Current allowance: ', el('span', { class: 'strong', text: intFmt(fs.cap) }),
+      override != null ? ' (override)' : ' (standard)'),
+    el('div', { class: 'row' }, ovInput, ovSave, ovClear),
+    flashMsg(d, 'override'));
+  return card;
+}
+
+function sectionUsageCard(d) {
+  const card = el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'Usage' }),
+      tip('One scan is one page read successfully. Free scans used counts every scan this user has ever made.')));
+  const p = d.plan;
+  if (!p) { card.append(skeletonRows(2, 18)); return card; }
+  const scans = p.scans || {};
+  const fs = p.free_scans || {};
+  const kind = p.plan_summary && p.plan_summary.kind;
+  const unlimited = kind === 'pro' || kind === 'comped';
+  card.append(aggList([
+    ['Scans, last 30 days', intFmt(scans.d30)],
+    ['Scans, all time', intFmt(scans.all_time)],
+    ['Free scans used', intFmt(fs.used) + ' of ' + intFmt(fs.cap) + (fs.override != null ? ' (override)' : '') +
+      (unlimited ? ', not limited on this plan' : '')],
+    ['Deals', intFmt(p.deals_total)],
+    ['Last scan', p.last_scan_at ? relTimeEl(p.last_scan_at) : 'Never'],
+    ['Joined', fmtDateTime(p.created_at)],
+    ['Last active', fmtDateTime(p.last_active)],
+  ]));
+  return card;
+}
+
+function sectionRcEventsCard(d) {
+  const card = el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'RevenueCat events' }),
+      tip('The last 25 messages RevenueCat sent about this user’s subscription, and whether each one was applied.')));
+  const p = d.plan;
+  if (!p) { card.append(skeletonRows(2, 18)); return card; }
+  const events = Array.isArray(p.rc_events) ? p.rc_events : [];
+  if (!events.length) {
+    card.append(emptyState('No RevenueCat events recorded yet', 'Purchases, renewals and cancellations appear here as RevenueCat sends them.'));
+    return card;
+  }
+  card.append(buildTable(
+    [{ label: 'Event' }, { label: 'Environment' }, { label: 'Happened' }, { label: 'Received' }, { label: 'Status' }],
+    events.map((ev) => {
+      const status = rcEventStatus(ev);
+      const cls = status === 'Applied' ? 'badge-success'
+        : /will retry/.test(status) ? 'badge-warning' : 'badge-neutral';
+      return {
+        cells: [rcEventName(ev.event_type), rcEnvironment(ev.environment), relTimeEl(ev.event_at),
+          relTimeEl(ev.received_at), el('span', { class: 'badge ' + cls, text: status })],
+      };
+    })));
+  return card;
+}
+
+function sectionPlanHistoryCard(d) {
+  const card = el('div', { class: 'card' },
+    el('div', { class: 'card-title' }, el('h2', { text: 'Plan history' }),
+      tip('The last 25 plan changes made in this panel for this user: comps, free scan overrides and RevenueCat refreshes.')));
+  const p = d.plan;
+  if (!p) { card.append(skeletonRows(2, 18)); return card; }
+  const rows = Array.isArray(p.entitlement_actions) ? p.entitlement_actions : [];
+  if (!rows.length) {
+    card.append(emptyState('No plan changes yet', 'Comps, free scan overrides and RevenueCat refreshes made here will appear in this list.'));
+    return card;
+  }
+  card.append(buildTable(
+    [{ label: 'When' }, { label: 'Change' }, { label: 'By' }],
+    rows.map((a) => ({ cells: [relTimeEl(a.created_at), adminHistoryText(a), a.actor || '—'] }))));
+  return card;
 }
 
 function sectionDeals(d) {
